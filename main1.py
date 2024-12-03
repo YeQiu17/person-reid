@@ -36,17 +36,17 @@ class FeatureExtractor:
 
 class MultiCameraTracker:
     def __init__(self, camera_urls, db_connection_string):
-        self.yolo_model = YOLO('yolov8m.pt')
-        self.detection_confidence = 0.5
+        self.yolo_model = YOLO('yolov8n.pt')
+        self.detection_confidence = 0.7
         self.feature_extractor = FeatureExtractor()
         self.db = ReIDDatabase(db_connection_string)
 
         self.persons = {}  # Map of person ID to historical features
         self.camera_persons = defaultdict(dict)  # Track per-camera person states
         self.recent_global_ids = deque(maxlen=100)  # Avoid duplicate cross-camera IDs
-        self.camera_trackers = {i: DeepSort(max_age=30, n_init=3, nms_max_overlap=1.0, max_cosine_distance=0.3)
-                                 for i in range(len(camera_urls))}
-        self.match_threshold = 0.75
+        self.camera_trackers = {i: DeepSort(max_age=30, n_init=3, nms_max_overlap=0.6, max_cosine_distance=0.4)
+                                 for i in range(len(camera_urls))}  # Fine-tuned parameters
+        self.match_threshold = 0.8  # Increased threshold for stricter matching
         self.feature_history = defaultdict(lambda: deque(maxlen=10))
         self.camera_urls = camera_urls
 
@@ -76,10 +76,11 @@ class MultiCameraTracker:
         )
 
     def is_inside_zone(self, center, door_zone):
-        """Check if a point is inside a given door zone."""
+        """Check if a point is inside a given door zone with a margin."""
         (x_min, y_min), (x_max, y_max) = door_zone
         x, y = center
-        return x_min <= x <= x_max and y_min <= y <= y_max
+        margin = 10  # Add margin to reduce false positives
+        return x_min - margin <= x <= x_max + margin and y_min - margin <= y <= y_max + margin
 
     def _compute_similarity(self, features1, features2):
         """Compute cosine similarity between two normalized feature vectors."""
@@ -132,75 +133,75 @@ class MultiCameraTracker:
         return transform(pil_img).unsqueeze(0)
 
     async def process_frame(self, frame, camera_id):
-        """Process a single frame from a camera, detect entry/exit events."""
-        if camera_id not in self.door_zones:
-            # Dynamically define door zone
-            frame_height, frame_width = frame.shape[:2]
-            self.door_zones[camera_id] = [
-                (int(0.3 * frame_width), int(0.4 * frame_height)),
-                (int(0.7 * frame_width), int(0.6 * frame_height))
-            ]
+            """Process a single frame from a camera."""
+            if camera_id not in self.door_zones:
+                # Dynamically define door zone
+                frame_height, frame_width = frame.shape[:2]
+                self.door_zones[camera_id] = [
+                    (int(0.3 * frame_width), int(0.4 * frame_height)),
+                    (int(0.7 * frame_width), int(0.6 * frame_height))
+                ]
 
-        detections = []
-        results = self.yolo_model.predict(frame, conf=self.detection_confidence, classes=0)
-        if results and len(results[0].boxes) > 0:
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                conf = float(box.conf)
-                if conf < self.detection_confidence:
+            detections = []
+            results = self.yolo_model.predict(frame, conf=self.detection_confidence, classes=0)
+            if results and len(results[0].boxes) > 0:
+                for box in results[0].boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                    conf = float(box.conf)
+                    if conf < self.detection_confidence:
+                        continue
+                    w, h = x2 - x1, y2 - y1
+                    if w * h < 100:  # Ignore too small boxes
+                        continue
+                    detections.append(([x1, y1, w, h], conf, 'person'))
+
+            tracks = self.camera_trackers[camera_id].update_tracks(detections, frame=frame)
+            for track in tracks:
+                if not track.is_confirmed():
                     continue
-                w, h = x2 - x1, y2 - y1
-                if w * h < 100:  # Ignore too small boxes
+
+                # Extract ReID features
+                x1, y1, x2, y2 = map(int, track.to_tlbr())
+                person_img = frame[y1:y2, x1:x2]
+                if person_img.size == 0:
                     continue
-                detections.append(([x1, y1, w, h], conf, 'person'))
 
-        tracks = self.camera_trackers[camera_id].update_tracks(detections, frame=frame)
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
+                person_img_tensor = self._preprocess_image(person_img)
+                features = self.feature_extractor.extract(person_img_tensor)
+                if features is None or features.size == 0:
+                    continue
 
-            # Extract ReID features
-            x1, y1, x2, y2 = map(int, track.to_tlbr())
-            person_img = frame[y1:y2, x1:x2]
-            if person_img.size == 0:
-                continue
+                global_id = await self._find_or_create_person(features, camera_id)
+                center = ((x1 + x2) // 2, (y1 + y2) // 2)
 
-            person_img_tensor = self._preprocess_image(person_img)
-            features = self.feature_extractor.extract(person_img_tensor)
-            if features is None or features.size == 0:
-                continue
+                # Process entry/exit logic
+                door_zone = self.door_zones[camera_id]
+                previous_position = self.camera_persons[camera_id].get(global_id, {}).get("last_position")
+                self.camera_persons[camera_id][global_id] = {"last_position": center}
+                if previous_position:
+                    in_zone = self.is_inside_zone(center, door_zone)
+                    was_in_zone = self.is_inside_zone(previous_position, door_zone)
+                    if not was_in_zone and in_zone:  # Entry event
+                        self.entry_exit_counts[camera_id]["entry"] += 1
+                        await self.update_counts_in_db(camera_id)
+                    elif was_in_zone and not in_zone:  # Exit event
+                        self.entry_exit_counts[camera_id]["exit"] += 1
+                        await self.update_counts_in_db(camera_id)
 
-            global_id = await self._find_or_create_person(features, camera_id)
-            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                # Draw bounding box and display ID
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID: {global_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            # Process entry/exit logic
-            door_zone = self.door_zones[camera_id]
-            previous_position = self.camera_persons[camera_id].get(global_id, {}).get("last_position")
-            self.camera_persons[camera_id][global_id] = {"last_position": center}
-            if previous_position:
-                in_zone = self.is_inside_zone(center, door_zone)
-                was_in_zone = self.is_inside_zone(previous_position, door_zone)
-                if not was_in_zone and in_zone:  # Entry event
-                    self.entry_exit_counts[camera_id]["entry"] += 1
-                    await self.update_counts_in_db(camera_id)
-                elif was_in_zone and not in_zone:  # Exit event
-                    self.entry_exit_counts[camera_id]["exit"] += 1
-                    await self.update_counts_in_db(camera_id)
+            # Draw door zone and counts
+            (x_min, y_min), (x_max, y_max) = self.door_zones[camera_id]
+            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
+            cv2.putText(frame, "Door Zone", (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # Draw bounding box and display ID
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"ID: {global_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        # Draw door zone and counts
-        (x_min, y_min), (x_max, y_max) = self.door_zones[camera_id]
-        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
-        cv2.putText(frame, "Door Zone", (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-        entry_count = self.entry_exit_counts[camera_id]["entry"]
-        exit_count = self.entry_exit_counts[camera_id]["exit"]
-        cv2.putText(frame, f"Entry: {entry_count} | Exit: {exit_count}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        return frame
+            entry_count = self.entry_exit_counts[camera_id]["entry"]
+            exit_count = self.entry_exit_counts[camera_id]["exit"]
+            cv2.putText(frame, f"Entry: {entry_count} | Exit: {exit_count}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            return frame
 
     async def run(self):
         """Run the tracker for all cameras."""
@@ -219,6 +220,7 @@ class MultiCameraTracker:
         finally:
             for cap in caps:
                 cap.release()
+
             cv2.destroyAllWindows()
 
 if __name__ == "__main__":
