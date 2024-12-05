@@ -1,0 +1,42 @@
+2024-12-04 12:40:25,453 - INFO: MobileNetV2 Embedder for Deep Sort initialised
+2024-12-04 12:40:25,453 - INFO: - gpu enabled: True
+2024-12-04 12:40:25,453 - INFO: - half precision: True
+2024-12-04 12:40:25,453 - INFO: - max batch size: 16
+2024-12-04 12:40:25,453 - INFO: - expects BGR: True
+2024-12-04 12:40:25,687 - INFO: DeepSort Tracker initialised
+2024-12-04 12:40:25,687 - INFO: - max age: 30
+2024-12-04 12:40:25,687 - INFO: - appearance threshold: 0.4
+2024-12-04 12:40:25,687 - INFO: - nms threshold: 0.6
+2024-12-04 12:40:25,687 - INFO: - max num of appearance features: None
+2024-12-04 12:40:25,687 - INFO: - overriding track class : No
+2024-12-04 12:40:25,687 - INFO: - today given : No
+2024-12-04 12:40:25,687 - INFO: - in-build embedder : Yes
+2024-12-04 12:40:25,687 - INFO: - polygon detections : No
+2024-12-04 12:41:50,505 - INFO: MobileNetV2 Embedder for Deep Sort initialised
+2024-12-04 12:41:50,505 - INFO: - gpu enabled: True
+2024-12-04 12:41:50,505 - INFO: - half precision: True
+2024-12-04 12:41:50,505 - INFO: - max batch size: 16
+2024-12-04 12:41:50,505 - INFO: - expects BGR: True
+2024-12-04 12:41:50,711 - INFO: DeepSort Tracker initialised
+2024-12-04 12:41:50,711 - INFO: - max age: 30
+2024-12-04 12:41:50,711 - INFO: - appearance threshold: 0.4
+2024-12-04 12:41:50,711 - INFO: - nms threshold: 0.6
+2024-12-04 12:41:50,711 - INFO: - max num of appearance features: None
+2024-12-04 12:41:50,711 - INFO: - overriding track class : No
+2024-12-04 12:41:50,711 - INFO: - today given : No
+2024-12-04 12:41:50,711 - INFO: - in-build embedder : Yes
+2024-12-04 12:41:50,711 - INFO: - polygon detections : No
+2024-12-04 12:42:16,806 - ERROR: Feature extraction error: OpenCV(4.10.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cv::cvtColor'
+
+2024-12-04 12:42:17,017 - ERROR: Feature extraction error: OpenCV(4.10.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cv::cvtColor'
+
+2024-12-04 12:42:17,221 - ERROR: Feature extraction error: OpenCV(4.10.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cv::cvtColor'
+
+2024-12-04 12:42:17,418 - ERROR: Feature extraction error: OpenCV(4.10.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cv::cvtColor'
+
+2024-12-04 12:42:17,653 - ERROR: Feature extraction error: OpenCV(4.10.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cv::cvtColor'
+
+2024-12-04 12:42:17,916 - ERROR: Feature extraction error: OpenCV(4.10.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cv::cvtColor'
+
+2024-12-04 12:42:18,129 - ERROR: Feature extraction error: OpenCV(4.10.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cv::cvtColor'
+

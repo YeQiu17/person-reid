@@ -36,8 +36,8 @@ class FeatureExtractor:
 
 class MultiCameraTracker:
     def __init__(self, camera_urls, db_connection_string):
-        self.yolo_model = YOLO('yolov8n.pt')
-        self.detection_confidence = 0.7
+        self.yolo_model = YOLO('yolov8m.pt')
+        self.detection_confidence = 0.65
         self.feature_extractor = FeatureExtractor()
         self.db = ReIDDatabase(db_connection_string)
 
@@ -46,7 +46,7 @@ class MultiCameraTracker:
         self.recent_global_ids = deque(maxlen=100)  # Avoid duplicate cross-camera IDs
         self.camera_trackers = {i: DeepSort(max_age=30, n_init=3, nms_max_overlap=0.6, max_cosine_distance=0.4)
                                  for i in range(len(camera_urls))}  # Fine-tuned parameters
-        self.match_threshold = 0.8  # Increased threshold for stricter matching
+        self.match_threshold = 0.7  # Increased threshold for stricter matching
         self.feature_history = defaultdict(lambda: deque(maxlen=10))
         self.camera_urls = camera_urls
 
@@ -225,6 +225,7 @@ class MultiCameraTracker:
 
 if __name__ == "__main__":
     camera_urls = ['video5.mp4']
+    # camera_urls = ['cam-1M.mp4','cam-2M.mp4']
     db_connection_string = "AccountEndpoint=https://occupancytrackerdb.documents.azure.com:443/;AccountKey=NTTvzWNTTmZ3I0rydqqnIIjPDGG5RxXVCYa9WS78XK4PvUXUGCS9Tx9s8xnfs4rSfS2xD2deHAGUACDbIMdVxA==;"
     tracker = MultiCameraTracker(camera_urls, db_connection_string)
     asyncio.run(tracker.run())
