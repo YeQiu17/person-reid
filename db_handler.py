@@ -8,12 +8,13 @@ import numpy as np
 
 
 class ReIDDatabase:
-    def __init__(self, connection_string, database_name="reid_db", container_name="person_features", counts_container_name="enter_exit_count"):
+    def __init__(self, connection_string, database_name="reid_db", container_name="person_features", counts_container_name="enter_exit_count", setup_container_name="setup-details"):
         self.client = CosmosClient.from_connection_string(connection_string)
 
         # Ensure database creation
         self.database = self.client.create_database_if_not_exists(id=database_name)
         self.counts_container_name = counts_container_name
+        self.setup_container_name = setup_container_name
 
         # Create or access containers
         self.container = self.database.create_container_if_not_exists(
@@ -30,6 +31,10 @@ class ReIDDatabase:
             id=self.counts_container_name,
             partition_key=PartitionKey(path="/camera_id"),
         )
+        self.setup_container = self.database.create_container_if_not_exists(
+            id=self.setup_container_name,
+            partition_key=PartitionKey(path="/id"),
+        )
         self.setup_logging()
 
     def setup_logging(self):
@@ -39,6 +44,18 @@ class ReIDDatabase:
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
+        
+    def get_camera_setup_details(self):
+        """Retrieve camera setup details from the `setup-details` container."""
+        try:
+            query = "SELECT * FROM c"
+            items = self.setup_container.query_items(query, enable_cross_partition_query=True)
+            for item in items:
+                return item  # Assuming there is one setup detail document
+            return {}
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to retrieve camera setup details: {str(e)}")
+            return {}
 
     def _serialize_features(self, features):
         """Convert numpy array to list for JSON serialization."""

@@ -10,8 +10,10 @@ from db_handler import ReIDDatabase
 import torchreid
 import torch.nn.functional as F
 from collections import defaultdict, deque
+import faiss
 import os
 import logging
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 class FeatureExtractor:
@@ -44,17 +46,21 @@ class MultiCameraTracker:
         self.persons = {}  # Map of person ID to historical features
         self.camera_persons = defaultdict(dict)  # Track per-camera person states
         self.recent_global_ids = deque(maxlen=100)  # Avoid duplicate cross-camera IDs
-        self.camera_trackers = {i: DeepSort(max_age=30, n_init=3, nms_max_overlap=0.6, max_cosine_distance=0.4)
-                                 for i in range(len(camera_urls))}  # Fine-tuned parameters
-        self.match_threshold = 0.7  # Increased threshold for stricter matching
+        self.camera_trackers = {
+            i: DeepSort(max_age=30, n_init=3, nms_max_overlap=0.6, max_cosine_distance=0.4)
+            for i in range(len(camera_urls))
+        }
+        self.match_threshold = 0.65  # Increased threshold for stricter matching
         self.feature_history = defaultdict(lambda: deque(maxlen=10))
         self.camera_urls = camera_urls
-
+        self.faiss_index = faiss.IndexFlatL2(self.feature_extractor.feature_dim)
+        
+        self.person_id_map = {}  # Map FAISS index positions to person IDs
         self.door_zones = {}  # Dynamically defined based on frame size
         self.entry_exit_counts = defaultdict(lambda: {"entry": 0, "exit": 0})
 
     async def initialize_state_from_db(self):
-        """Initialize counts and person features from the database."""
+        """Initialize the FAISS index and local state from the database."""
         counts = self.db.get_all_counts()
         for camera_id, count_data in counts.items():
             self.entry_exit_counts[camera_id]["entry"] = count_data.get("entry", 0)
@@ -62,10 +68,15 @@ class MultiCameraTracker:
 
         all_persons = self.db.get_all_persons()
         for person_id, features in all_persons.items():
-            self.persons[int(person_id)] = {
-                "features": np.array(features),
-                "history": set()
-            }
+            person_id = int(person_id)
+            features = np.array(features, dtype=np.float32)
+
+            # Add features to FAISS
+            self.faiss_index.add(np.array([features], dtype=np.float32))
+            self.person_id_map[self.faiss_index.ntotal - 1] = person_id
+
+            # Update local state
+            self.persons[person_id] = {"features": features, "history": set()}
 
     async def update_counts_in_db(self, camera_id):
         """Update counts in the database for a specific camera."""
@@ -75,51 +86,64 @@ class MultiCameraTracker:
             self.entry_exit_counts[camera_id]["exit"]
         )
 
+    def _compute_similarity(self, features):
+        """Find the most similar feature vector in the FAISS index."""
+        features = features / np.linalg.norm(features)  # Normalize the features
+        distances, indices = self.faiss_index.search(np.array([features], dtype=np.float32), 1)  # Find the nearest match
+        return indices[0][0], distances[0][0]
+
+    async def _find_or_create_person(self, features, camera_id):
+        """Find a matching person using FAISS and the database or create a new one."""
+        if features is None:
+            return None
+
+        matched_person_id = None
+        best_match_score = -1
+
+        if self.faiss_index.ntotal > 0:
+            # Query FAISS for the nearest match
+            index, distance = self._compute_similarity(features)
+
+            if distance < self.match_threshold:
+                matched_person_id = self.person_id_map.get(index)
+                if matched_person_id is not None:
+                    # Retrieve features from the database for verification
+                    db_features = self.db.get_person_features(matched_person_id)
+                    if db_features is not None:
+                        similarity = np.dot(features, np.array(db_features).T)
+                        if similarity > best_match_score:
+                            best_match_score = similarity
+                            matched_person_id = matched_person_id
+
+        if matched_person_id is not None:
+            # Update person's history and recent IDs
+            self.persons[matched_person_id]["history"].add(camera_id)
+            if matched_person_id not in self.recent_global_ids:
+                self.recent_global_ids.append(matched_person_id)
+            return matched_person_id
+
+        # If no match is found, create a new person ID
+        new_id = max(self.persons.keys(), default=0) + 1
+        self.feature_history[new_id].append(features)
+
+        # Update FAISS index and mappings
+        self.faiss_index.add(np.array([features], dtype=np.float32))
+        self.person_id_map[self.faiss_index.ntotal - 1] = new_id
+
+        # Update database
+        self.db.store_person(new_id, features.tolist(), camera_id)
+
+        # Update local state
+        self.persons[new_id] = {"features": features, "history": {camera_id}}
+        self.recent_global_ids.append(new_id)
+        return new_id
+
     def is_inside_zone(self, center, door_zone):
         """Check if a point is inside a given door zone with a margin."""
         (x_min, y_min), (x_max, y_max) = door_zone
         x, y = center
         margin = 10  # Add margin to reduce false positives
         return x_min - margin <= x <= x_max + margin and y_min - margin <= y <= y_max + margin
-
-    def _compute_similarity(self, features1, features2):
-        """Compute cosine similarity between two normalized feature vectors."""        
-        if not (np.linalg.norm(features1) and np.linalg.norm(features2)):
-            return 0  # Avoid division by zero
-        features1 = features1 / np.linalg.norm(features1)
-        features2 = features2 / np.linalg.norm(features2)
-        return np.dot(features1, features2)
-
-    async def _find_or_create_person(self, features, camera_id):
-        """Find a matching person in the database or create a new one."""
-        if features is None:
-            return None
-
-        best_match_id = None
-        best_match_score = -1
-
-        # Search for the best match among known persons
-        for person_id, person_data in self.persons.items():
-            stored_features = person_data["features"]
-            similarity = self._compute_similarity(features, stored_features)
-            if similarity > best_match_score:
-                best_match_score = similarity
-                best_match_id = person_id
-
-        # Check match threshold
-        if best_match_score > self.match_threshold:
-            self.persons[best_match_id]["history"].add(camera_id)
-            if best_match_id not in self.recent_global_ids:
-                self.recent_global_ids.append(best_match_id)
-            return best_match_id
-
-        # If no match is found, create a new ID
-        new_id = max(self.persons.keys(), default=0) + 1
-        self.feature_history[new_id].append(features)
-        self.persons[new_id] = {"features": features, "history": {camera_id}}
-        self.db.store_person(new_id, features, camera_id)
-        self.recent_global_ids.append(new_id)
-        return new_id
 
     def _preprocess_image(self, person_img):
         """Preprocess image for feature extraction."""
@@ -197,6 +221,8 @@ class MultiCameraTracker:
                 frames = [cap.read()[1] for cap in caps]
                 tasks = [self.process_frame(frame, i) for i, frame in enumerate(frames) if frame is not None]
                 await asyncio.gather(*tasks)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         finally:
             for cap in caps:
                 cap.release()

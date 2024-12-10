@@ -13,6 +13,7 @@ from collections import defaultdict, deque
 import faiss
 import os
 import logging
+import json
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -37,8 +38,12 @@ class FeatureExtractor:
         return features.cpu().numpy()[0]
 
 class MultiCameraTracker:
-    def __init__(self, camera_urls, db_connection_string):
-        self.yolo_model = YOLO('yolov8n.pt')
+    def __init__(self, camera_details_json, db_connection_string):
+        camera_details = json.loads(camera_details_json)
+        self.camera_urls = []
+        self.camera_positions = {}  # Map camera_id to position (inside-out or outside-in)
+        self.door_zones = {}  # Map camera_id to door zone coordinates
+        self.yolo_model = YOLO('yolov8m.pt')
         self.detection_confidence = 0.65
         self.feature_extractor = FeatureExtractor()
         self.db = ReIDDatabase(db_connection_string)
@@ -46,18 +51,31 @@ class MultiCameraTracker:
         self.persons = {}  # Map of person ID to historical features
         self.camera_persons = defaultdict(dict)  # Track per-camera person states
         self.recent_global_ids = deque(maxlen=100)  # Avoid duplicate cross-camera IDs
-        self.camera_trackers = {
-            i: DeepSort(max_age=30, n_init=3, nms_max_overlap=0.6, max_cosine_distance=0.4)
-            for i in range(len(camera_urls))
-        }
-        self.match_threshold = 0.7  # Increased threshold for stricter matching
+        self.camera_trackers = {}  # Map camera_id to DeepSort instances
+        self.match_threshold = 0.65  # Increased threshold for stricter matching
         self.feature_history = defaultdict(lambda: deque(maxlen=10))
-        self.camera_urls = camera_urls
+
         self.faiss_index = faiss.IndexFlatL2(self.feature_extractor.feature_dim)
-        
         self.person_id_map = {}  # Map FAISS index positions to person IDs
-        self.door_zones = {}  # Dynamically defined based on frame size
         self.entry_exit_counts = defaultdict(lambda: {"entry": 0, "exit": 0})
+
+        self._initialize_cameras(camera_details)
+
+
+    def _initialize_cameras(self, camera_details):
+        """Parse camera details from JSON and initialize trackers and zones."""
+        for camera in camera_details['cameraDetails']:
+            entrance_name = camera['entranceName']
+            camera_id = entrance_name  # Use entrance name as the camera ID
+            video_url = camera['videoUrl']
+            door_coords = camera['doorCoordinates']
+            camera_position = camera['cameraPosition']
+
+            # Store camera-specific details
+            self.camera_urls.append(video_url)
+            self.camera_positions[camera_id] = camera_position
+            self.door_zones[camera_id] = door_coords
+            self.camera_trackers[camera_id] = DeepSort(max_age=30, n_init=3, nms_max_overlap=0.6, max_cosine_distance=0.4)
 
     async def initialize_state_from_db(self):
         """Initialize the FAISS index and local state from the database."""
@@ -139,11 +157,12 @@ class MultiCameraTracker:
         return new_id
 
     def is_inside_zone(self, center, door_zone):
-        """Check if a point is inside a given door zone with a margin."""
-        (x_min, y_min), (x_max, y_max) = door_zone
-        x, y = center
-        margin = 10  # Add margin to reduce false positives
-        return x_min - margin <= x <= x_max + margin and y_min - margin <= y <= y_max + margin
+            """Check if a point is inside a given door zone with a margin."""
+            (x_min, y_min), (x_max, y_max) = door_zone
+            x, y = center
+            margin = 10  # Add margin to reduce false positives
+            return x_min - margin <= x <= x_max + margin and y_min - margin <= y <= y_max + margin
+
 
     def _preprocess_image(self, person_img):
         """Preprocess image for feature extraction."""
@@ -158,14 +177,6 @@ class MultiCameraTracker:
 
     async def process_frame(self, frame, camera_id):
         """Process a single frame from a camera."""
-        if camera_id not in self.door_zones:
-            # Dynamically define door zone
-            frame_height, frame_width = frame.shape[:2]
-            self.door_zones[camera_id] = [
-                (int(0.3 * frame_width), int(0.4 * frame_height)),
-                (int(0.7 * frame_width), int(0.6 * frame_height))
-            ]
-
         detections = []
         results = self.yolo_model.predict(frame, conf=self.detection_confidence, classes=0)
         if results and len(results[0].boxes) > 0:
@@ -198,19 +209,28 @@ class MultiCameraTracker:
             global_id = await self._find_or_create_person(features, camera_id)
             center = ((x1 + x2) // 2, (y1 + y2) // 2)
 
-            # Process entry/exit logic
+            # Process entry/exit logic based on camera position
             door_zone = self.door_zones[camera_id]
+            position = self.camera_positions[camera_id]
             previous_position = self.camera_persons[camera_id].get(global_id, {}).get("last_position")
             self.camera_persons[camera_id][global_id] = {"last_position": center}
             if previous_position:
                 in_zone = self.is_inside_zone(center, door_zone)
                 was_in_zone = self.is_inside_zone(previous_position, door_zone)
-                if not was_in_zone and in_zone:  # Entry event
-                    self.entry_exit_counts[camera_id]["entry"] += 1
-                    await self.update_counts_in_db(camera_id)
-                elif was_in_zone and not in_zone:  # Exit event
-                    self.entry_exit_counts[camera_id]["exit"] += 1
-                    await self.update_counts_in_db(camera_id)
+                if position == 'inside-out':
+                    if not was_in_zone and in_zone:  # Exit event
+                        self.entry_exit_counts[camera_id]["exit"] += 1
+                        await self.update_counts_in_db(camera_id)
+                    elif was_in_zone and not in_zone:  # Entry event
+                        self.entry_exit_counts[camera_id]["entry"] += 1
+                        await self.update_counts_in_db(camera_id)
+                elif position == 'outside-in':
+                    if not was_in_zone and in_zone:  # Entry event
+                        self.entry_exit_counts[camera_id]["entry"] += 1
+                        await self.update_counts_in_db(camera_id)
+                    elif was_in_zone and not in_zone:  # Exit event
+                        self.entry_exit_counts[camera_id]["exit"] += 1
+                        await self.update_counts_in_db(camera_id)
 
             # Draw bounding box and display ID
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -226,6 +246,7 @@ class MultiCameraTracker:
         cv2.putText(frame, f"Entry: {entry_count} | Exit: {exit_count}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         return frame
+
 
     async def run(self):
         """Run the tracker for all cameras."""
@@ -246,8 +267,19 @@ class MultiCameraTracker:
                 cap.release()
             cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    camera_urls = ['video5.mp4']
+async def main():
     db_connection_string = "AccountEndpoint=https://occupancytrackerdb.documents.azure.com:443/;AccountKey=NTTvzWNTTmZ3I0rydqqnIIjPDGG5RxXVCYa9WS78XK4PvUXUGCS9Tx9s8xnfs4rSfS2xD2deHAGUACDbIMdVxA==;"
-    tracker = MultiCameraTracker(camera_urls, db_connection_string)
-    asyncio.run(tracker.run())
+    db_handler = ReIDDatabase(db_connection_string)
+    camera_setup_details = db_handler.get_camera_setup_details()
+    if not camera_setup_details:
+        print("Failed to fetch camera setup details from the database. Exiting...")
+        return
+    camera_details_json = json.dumps({
+        "cameraDetails": camera_setup_details["cameraDetails"]
+    })
+    tracker = MultiCameraTracker(camera_details_json, db_connection_string)
+    await tracker.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
