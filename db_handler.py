@@ -8,7 +8,7 @@ import numpy as np
 
 
 class ReIDDatabase:
-    def __init__(self, connection_string, database_name="reid_db", container_name="person_features", counts_container_name="enter_exit_count", setup_container_name="setup-details"):
+    def __init__(self, connection_string, database_name="occupancydb", container_name="person_features", counts_container_name="enter_exit_count", setup_container_name="setup-details"):
         self.client = CosmosClient.from_connection_string(connection_string)
 
         # Ensure database creation

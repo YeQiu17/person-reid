@@ -224,7 +224,7 @@ class MultiCameraTracker:
             cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    camera_urls = ['video5.mp4']
+    camera_urls = [r'rtsp://Yectra:Yectra123@192.168.1.15:554/stream2']
     # camera_urls = ['cam-1M.mp4','cam-2M.mp4']
     db_connection_string = "AccountEndpoint=https://occupancytrackerdb.documents.azure.com:443/;AccountKey=NTTvzWNTTmZ3I0rydqqnIIjPDGG5RxXVCYa9WS78XK4PvUXUGCS9Tx9s8xnfs4rSfS2xD2deHAGUACDbIMdVxA==;"
     tracker = MultiCameraTracker(camera_urls, db_connection_string)
