@@ -44,7 +44,7 @@ class MultiCameraTracker:
         self.camera_positions = {}  # Map camera_id to position (inside-out or outside-in)
         self.door_zones = {}  # Map camera_id to door zone coordinates
         self.yolo_model = YOLO('yolov8m.pt')
-        self.detection_confidence = 0.65
+        self.detection_confidence = 0.7
         self.feature_extractor = FeatureExtractor()
         self.db = ReIDDatabase(db_connection_string)
  
@@ -52,7 +52,7 @@ class MultiCameraTracker:
         self.camera_persons = defaultdict(dict)  # Track per-camera person states
         self.recent_global_ids = deque(maxlen=100)  # Avoid duplicate cross-camera IDs
         self.camera_trackers = {}  # Map camera_id to DeepSort instances
-        self.match_threshold = 0.65  # Increased threshold for stricter matching
+        self.match_threshold = 0.7  # Increased threshold for stricter matching
         self.feature_history = defaultdict(lambda: deque(maxlen=10))
  
         self.faiss_index = faiss.IndexFlatL2(self.feature_extractor.feature_dim)

@@ -161,7 +161,7 @@ class ReIDDatabase:
             items = self.counts_container.query_items(query, enable_cross_partition_query=True)
 
             for item in items:
-                counts[int(item["camera_id"])] = {
+                counts[str(item["camera_id"])] = {
                     "entry": int(item.get("entry", 0)),
                     "exit": int(item.get("exit", 0))
                 }
