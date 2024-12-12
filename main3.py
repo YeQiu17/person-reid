@@ -226,7 +226,7 @@ class MultiCameraTracker:
         (x_min, y_min), (x_max, y_max) = self.door_zones[camera_id]
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
         cv2.putText(frame, "Door Zone", (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
+    
         entry_count = self.entry_exit_counts[camera_id]["entry"]
         exit_count = self.entry_exit_counts[camera_id]["exit"]
         cv2.putText(frame, f"Entry: {entry_count} | Exit: {exit_count}",
@@ -253,7 +253,7 @@ class MultiCameraTracker:
             cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    camera_urls = ['video.mp4']
+    camera_urls = ['video5.mp4']
     # camera_urls = ['cam-1M.mp4','cam-2M.mp4']
     db_connection_string = "AccountEndpoint=https://occupancytrackerdb.documents.azure.com:443/;AccountKey=NTTvzWNTTmZ3I0rydqqnIIjPDGG5RxXVCYa9WS78XK4PvUXUGCS9Tx9s8xnfs4rSfS2xD2deHAGUACDbIMdVxA==;"
     tracker = MultiCameraTracker(camera_urls, db_connection_string)
