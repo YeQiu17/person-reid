@@ -317,7 +317,7 @@ async def main():
     model_path = "osnet_x1_0_market_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip.pth"
     camera_sources = {
         0: 0,  # Camera 1
-        1: r'rtsp://Yectra:Yectra123@192.168.1.15:554/stream2',  # Camera 2
+        1: r"rtsp://Yectra:Yectra123@192.168.1.50:554/stream2",  # Camera 2
         # Add more cameras as needed
     }
 
