@@ -216,7 +216,7 @@ class MultiCameraTracker:
         """Run the tracker for all cameras."""
         await self.initialize_state_from_db()
         caps = [cv2.VideoCapture(url) for url in self.camera_urls]
-        try:
+        try:      
             while True:
                 frames = [cap.read()[1] for cap in caps]
                 tasks = [self.process_frame(frame, i) for i, frame in enumerate(frames) if frame is not None]

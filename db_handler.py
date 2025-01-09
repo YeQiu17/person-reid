@@ -1,14 +1,12 @@
-# db_handler.py
-
 import logging
 from azure.cosmos import CosmosClient, exceptions
 from azure.cosmos.partition_key import PartitionKey
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 
 
 class ReIDDatabase:
-    def __init__(self, connection_string, database_name="occupancydb", container_name="person_features", counts_container_name="enter_exit_count", setup_container_name="setup-details"):
+    def __init__(self, connection_string, database_name="occupancydb", container_name="person_features", counts_container_name="enter_exit_count", setup_container_name="setup-details", logs_container_name="logs"):
         self.client = CosmosClient.from_connection_string(connection_string)
 
         # Ensure database creation
@@ -35,6 +33,10 @@ class ReIDDatabase:
             id=self.setup_container_name,
             partition_key=PartitionKey(path="/id"),
         )
+        self.logs_container = self.database.create_container_if_not_exists(
+            id=logs_container_name,
+            partition_key=PartitionKey(path="/camera_id"),
+        )
         self.setup_logging()
 
     def setup_logging(self):
@@ -45,6 +47,51 @@ class ReIDDatabase:
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
         
+    def store_aggregated_log(self, camera_id, person_id, event_type, timestamp=None):
+        """Store logs as a single aggregated document in the logs container."""
+        try:
+            if timestamp is None:
+                timestamp = datetime.now(timezone.utc).isoformat()
+
+            # Retrieve existing aggregated log document
+            existing_doc = self.get_aggregated_logs(camera_id)
+
+            # If no existing document, create a new one
+            if not existing_doc:
+                existing_doc = {
+                    "id": camera_id,
+                    "camera_id": camera_id,
+                    "logs": []
+                }
+
+            # Append the new log entry
+            existing_doc["logs"].append({
+                "person_id": person_id,
+                "event_type": event_type,
+                "timestamp": timestamp
+            })
+
+            # Upsert the document back into the database
+            self.logs_container.upsert_item(existing_doc)
+            self.logger.info(f"Updated aggregated log for camera {camera_id}, person {person_id}, event {event_type}")
+            return True
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to store aggregated log: {str(e)}")
+            return False
+
+    def get_aggregated_logs(self, camera_id):
+        """Retrieve the aggregated log document for a specific camera."""
+        try:
+            query = f"SELECT * FROM c WHERE c.id = '{camera_id}'"
+            items = list(self.logs_container.query_items(query, enable_cross_partition_query=True))
+
+            if items:
+                return items[0]  # Return the aggregated logs document
+            return None
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to retrieve aggregated logs for camera {camera_id}: {str(e)}")
+            return None
+           
     def get_camera_setup_details(self):
         """Retrieve camera setup details from the `setup-details` container."""
         try:
@@ -69,7 +116,7 @@ class ReIDDatabase:
         """Store person features and metadata in Cosmos DB."""
         try:
             if timestamp is None:
-                timestamp = datetime.utcnow().isoformat()
+                timestamp = datetime.now(timezone.utc).isoformat()
 
             document = {
                 'id': f"{person_id}_{timestamp}",
@@ -77,7 +124,7 @@ class ReIDDatabase:
                 'features': self._serialize_features(features),
                 'camera_id': camera_id,
                 'timestamp': timestamp,
-                'last_updated': datetime.utcnow().isoformat()
+                'last_updated': datetime.now(timezone.utc).isoformat()
             }
             self.container.create_item(document)
             self.logger.info(f"Stored features for person {person_id} from camera {camera_id}")
@@ -130,7 +177,7 @@ class ReIDDatabase:
                     self.logger.info(f"Skipping update for person {person_id}, similarity={similarity}")
                     return False
 
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()
             self.store_person(person_id, new_features, camera_id, timestamp)
             self.logger.info(f"Updated features for person {person_id} from camera {camera_id}")
             return True
@@ -141,7 +188,7 @@ class ReIDDatabase:
     def cleanup_old_records(self, days_to_keep=30):
         """Remove records older than the specified number of days."""
         try:
-            cutoff_date = (datetime.utcnow() - timedelta(days=days_to_keep)).isoformat()
+            cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).isoformat()
             query = f"SELECT c.id, c.person_id FROM c WHERE c.timestamp < '{cutoff_date}'"
 
             items = self.container.query_items(query=query, enable_cross_partition_query=True)

@@ -56,7 +56,7 @@ class MultiCameraTracker:
         self.feature_history = defaultdict(lambda: deque(maxlen=10))
  
         self.faiss_index = faiss.IndexFlatL2(self.feature_extractor.feature_dim)
-        self.person_id_map = {}  # Map FAISS index positions to person IDs
+        self.person_id_map = {}  # Map FAISS index positions to person IDs    
         self.entry_exit_counts = defaultdict(lambda: {"entry": 0, "exit": 0})
  
         self._initialize_cameras(camera_details)
@@ -91,13 +91,19 @@ class MultiCameraTracker:
             person_id = int(person_id)
             features = np.array(features, dtype=np.float32)
  
-            # Add features to FAISS
+            # Add features to FAISS    
             self.faiss_index.add(np.array([features], dtype=np.float32))
             self.person_id_map[self.faiss_index.ntotal - 1] = person_id
  
             # Update local state
             self.persons[person_id] = {"features": features, "history": set()}
- 
+                
+        for camera_id in self.camera_positions.keys():
+            aggregated_logs = self.db.get_aggregated_logs(camera_id)
+            if aggregated_logs and "logs" in aggregated_logs:
+                for log in aggregated_logs["logs"]:
+                    event_type = log["event_type"]
+        
     async def update_counts_in_db(self, camera_id):
         """Update counts in the database for a specific camera."""
         self.db.update_counts(
@@ -183,7 +189,7 @@ class MultiCameraTracker:
         results = self.yolo_model.predict(frame, conf=self.detection_confidence, classes=0)
         if results and len(results[0].boxes) > 0:
             for box in results[0].boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())                         
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())                               
                 conf = float(box.conf)
                 if conf < self.detection_confidence:
                     continue
@@ -223,16 +229,20 @@ class MultiCameraTracker:
                     if not was_in_zone and in_zone:  # Exit event
                         self.entry_exit_counts[camera_id]["exit"] += 1
                         await self.update_counts_in_db(camera_id)
+                        self.db.store_aggregated_log(camera_id, global_id, "exit")  # Store aggregated log
                     elif was_in_zone and not in_zone:  # Entry event
                         self.entry_exit_counts[camera_id]["entry"] += 1
                         await self.update_counts_in_db(camera_id)
+                        self.db.store_aggregated_log(camera_id, global_id, "entry")
                 elif position == 'outside-in':
                     if not was_in_zone and in_zone:  # Entry event
                         self.entry_exit_counts[camera_id]["entry"] += 1
                         await self.update_counts_in_db(camera_id)
+                        self.db.store_aggregated_log(camera_id, global_id, "entry")
                     elif was_in_zone and not in_zone:  # Exit event
                         self.entry_exit_counts[camera_id]["exit"] += 1
                         await self.update_counts_in_db(camera_id)
+                        self.db.store_aggregated_log(camera_id, global_id, "exit")  # Store aggregated log
  
             # Draw bounding box and display ID
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -262,7 +272,7 @@ class MultiCameraTracker:
                     for i, frame in enumerate(frames) if frame is not None
                 ]
                 processed_frames = await asyncio.gather(*tasks)
-                for i, frame in enumerate(processed_frames):
+                for i, frame in enumerate(processed_frames):      
                     if frame is not None:
                         cv2.imshow(f"Camera {self.index_to_camera_id[i]}", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
