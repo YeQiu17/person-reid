@@ -1,226 +1,272 @@
-from msal import ConfidentialClientApplication
-import jwt
+import logging
 from azure.cosmos import CosmosClient, exceptions
 from azure.cosmos.partition_key import PartitionKey
-from datetime import datetime,timezone
-import logging
+from datetime import datetime, timedelta, timezone
 import numpy as np
 
-class B2CAuthenticator:
-    def __init__(self, tenant_id, client_id, client_secret, policy_name):
-        self.tenant_id = tenant_id
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.policy_name = policy_name
-        self.authority = f"https://{tenant_id}.b2clogin.com/{tenant_id}.onmicrosoft.com/{policy_name}"
-        
-        self.app = ConfidentialClientApplication(
-            client_id=client_id,
-            client_credential=client_secret,
-            authority=self.authority
-        )
-        
-    def validate_token(self, token):
-        try:
-            decoded_token = jwt.decode(
-                token,
-                options={"verify_signature": False}
-            )
-            return {
-                'user_id': decoded_token.get('oid'),
-                'org_id': decoded_token.get('extension_OrganizationId')
-            }
-        except jwt.InvalidTokenError:
-            return None
 
-class OrganizationPersonFeatures:
-    def __init__(self, connection_string, b2c_authenticator, database_name="occupancydb"):
+class ReIDDatabase:
+    def __init__(self, connection_string, database_name="occupancydb", container_name="person_features", 
+                 counts_container_name="enter_exit_count", setup_container_name="setup-details", 
+                 logs_container_name="logs"):
         self.client = CosmosClient.from_connection_string(connection_string)
-        self.b2c_authenticator = b2c_authenticator
         self.database = self.client.create_database_if_not_exists(id=database_name)
+        self.counts_container_name = counts_container_name
+        self.setup_container_name = setup_container_name
         
-        # Container for consolidated person features per organization
-        self.person_features_container = self.database.create_container_if_not_exists(
-            id="org_person_features",
-            partition_key=PartitionKey(path="/org_id")
+        # Create containers with organization_id as partition key
+        self.container = self.database.create_container_if_not_exists(
+            id=container_name,
+            partition_key=PartitionKey(path="/organization_id"),
+            indexing_policy={
+                'indexingMode': 'consistent',
+                'automatic': True,
+                'includedPaths': [{'path': '/*'}],
+                'excludedPaths': [{'path': '/persons/*/features/*'}]
+            }
         )
-        
-        # Container for entry/exit counts
         self.counts_container = self.database.create_container_if_not_exists(
-            id="org_counts",
-            partition_key=PartitionKey(path="/org_id")
+            id=self.counts_container_name,
+            partition_key=PartitionKey(path="/organization_id"),
         )
-        
-        # Container for activity logs
+        self.setup_container = self.database.create_container_if_not_exists(
+            id=self.setup_container_name,
+            partition_key=PartitionKey(path="/organization_id"),
+        )
         self.logs_container = self.database.create_container_if_not_exists(
-            id="org_logs",
-            partition_key=PartitionKey(path="/org_id")
+            id=logs_container_name,
+            partition_key=PartitionKey(path="/organization_id"),
         )
-        
         self.setup_logging()
+        self.organization_id = None
 
     def setup_logging(self):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
-        handler = logging.FileHandler('org_person_features.log')
+        handler = logging.FileHandler('reid_database.log')
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
 
-    def get_auth_info(self, token):
-        auth_info = self.b2c_authenticator.validate_token(token)
-        if not auth_info:
-            raise ValueError("Invalid token or missing organization ID")   
-        return auth_info
-
-    def _serialize_features(self, features):
-        return features.tolist() if isinstance(features, np.ndarray) else features
-
-    def _deserialize_features(self, features):
-        return np.array(features)
-
-    def get_org_document(self, token):
-        """Get or create organization's consolidated document."""
+    def initialize_organization(self):
+        """Get organization ID from setup details and initialize if needed."""
         try:
-            auth_info = self.get_auth_info(token)
-            org_id = auth_info['org_id']
-            
-            try:
-                org_doc = self.person_features_container.read_item(
-                    item=org_id,
-                    partition_key=org_id
-                )
-            except exceptions.CosmosResourceNotFoundError:
-                # Initialize new organization document
-                org_doc = {
-                    'id': org_id,
-                    'org_id': org_id,
-                    'persons': {},  # Dictionary of person_id -> person data
-                    'created_at': datetime.now(timezone.utc).isoformat(),
-                    'last_updated': datetime.now(timezone.utc).isoformat()
-                }
-                self.person_features_container.create_item(body=org_doc)
-            
-            return org_doc
-        except Exception as e:
-            self.logger.error(f"Failed to get organization document: {str(e)}")
-            raise
-
-    def store_person_features(self, token, person_id, features, camera_id):
-        """Store person features in the organization's consolidated document."""
-        try:
-            org_doc = self.get_org_document(token)
-            
-            # Create or update person entry
-            person_data = org_doc['persons'].get(person_id, {
-                'features_history': [],
-                'created_at': datetime.now(timezone.utc).isoformat()
-            })
-            
-            # Add new features
-            person_data['features_history'].append({
-                'features': self._serialize_features(features),
-                'camera_id': camera_id,
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            })
-            
-            # Keep only the last 10 feature entries
-            if len(person_data['features_history']) > 10:
-                person_data['features_history'] = person_data['features_history'][-10:]
-            
-            org_doc['persons'][person_id] = person_data
-            org_doc['last_updated'] = datetime.now(timezone.utc).isoformat()
-            
-            self.person_features_container.replace_item(
-                item=org_doc['id'],
-                body=org_doc
-            )
-            
-            self.logger.info(f"Stored features for person {person_id} in organization {org_doc['org_id']}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to store person features: {str(e)}")
-            return False
-
-    def get_person_features(self, token, person_id):
-        """Get latest features for a person from organization document."""
-        try:
-            org_doc = self.get_org_document(token)
-            person_data = org_doc['persons'].get(person_id)
-            
-            if not person_data or not person_data['features_history']:
-                return None
-                
-            # Return the most recent features
-            latest_features = person_data['features_history'][-1]['features']
-            return self._deserialize_features(latest_features)
-        except Exception as e:
-            self.logger.error(f"Failed to get person features: {str(e)}")
+            setup_details = self.get_camera_setup_details()
+            if setup_details:
+                self.organization_id = setup_details.get('organization_id')
+                return self.organization_id
+            return None
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to initialize organization: {str(e)}")
             return None
 
-    def update_counts(self, token, camera_id, counts_data):
-        """Update entry/exit counts for the organization."""
+    def _get_or_create_document(self, container, doc_type):
+        """Helper method to get or create organization document."""
+        if not self.organization_id:
+            self.initialize_organization()
+            if not self.organization_id:
+                raise ValueError("Organization ID not initialized")
+
         try:
-            auth_info = self.get_auth_info(token)
-            org_id = auth_info['org_id']
+            query = f"SELECT * FROM c WHERE c.organization_id = '{self.organization_id}'"
+            items = list(container.query_items(query, enable_cross_partition_query=True))
             
-            counts_doc = {
-                'id': f"{org_id}_counts",
-                'org_id': org_id,
-                'camera_counts': {
-                    camera_id: {
-                        'entry': counts_data['entry'],
-                        'exit': counts_data['exit'],
-                        'timestamp': datetime.now(timezone.utc).isoformat()
-                    }
-                },
-                'last_updated': datetime.now(timezone.utc).isoformat()
+            if items:
+                return items[0]
+            
+            # Create new document if none exists
+            new_doc = {
+                "id": self.organization_id,
+                "organization_id": self.organization_id,
+                "type": doc_type,
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
             
-            self.counts_container.upsert_item(body=counts_doc)
-            self.logger.info(f"Updated counts for camera {camera_id} in organization {org_id}")
+            if doc_type == "person_features":
+                new_doc["persons"] = {}
+            elif doc_type == "counts":
+                new_doc["cameras"] = {}
+            elif doc_type == "logs":
+                new_doc["logs"] = []
+                
+            return container.create_item(body=new_doc)
+            
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to get/create {doc_type} document: {str(e)}")
+            return None
+
+    def store_person(self, person_id, features, camera_id, timestamp=None):
+        """Store person features in the organization's document."""
+        try:
+            if timestamp is None:
+                timestamp = datetime.now(timezone.utc).isoformat()
+
+            doc = self._get_or_create_document(self.container, "person_features")
+            if not doc:
+                return False
+
+            if "persons" not in doc:
+                doc["persons"] = {}
+
+            doc["persons"][str(person_id)] = {
+                "features": self._serialize_features(features),
+                "camera_id": camera_id,
+                "timestamp": timestamp,
+                "last_updated": datetime.now(timezone.utc).isoformat()
+            }
+
+            self.container.replace_item(item=doc["id"], body=doc)
+            self.logger.info(f"Stored features for person {person_id} from camera {camera_id}")
             return True
-        except Exception as e:
-            self.logger.error(f"Failed to update counts: {str(e)}")
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to store person data: {str(e)}")
             return False
 
-    def store_log(self, token, person_id, event_type, camera_id):
-        """Store activity log for the organization."""
+    def get_person_features(self, person_id):
+        """Retrieve features for a person from the organization's document."""
         try:
-            auth_info = self.get_auth_info(token)
-            org_id = auth_info['org_id']
-            
-            log_doc = {
-                'id': f"{org_id}_logs",
-                'org_id': org_id,
-                'logs': [{
-                    'person_id': person_id,
-                    'event_type': event_type,
-                    'camera_id': camera_id,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                }],
-                'last_updated': datetime.now(timezone.utc).isoformat()
-            }
-            
-            self.logs_container.upsert_item(body=log_doc)
-            self.logger.info(f"Stored log for person {person_id} in organization {org_id}")
+            doc = self._get_or_create_document(self.container, "person_features")
+            if not doc or "persons" not in doc:
+                return None
+
+            person_data = doc["persons"].get(str(person_id))
+            if person_data:
+                return self._deserialize_features(person_data["features"])
+            return None
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to retrieve person features: {str(e)}")
+            return None
+
+    def get_all_persons(self):
+        """Retrieve all persons from the organization's document."""
+        try:
+            doc = self._get_or_create_document(self.container, "person_features")
+            if not doc or "persons" not in doc:
+                return {}
+
+            persons = {}
+            for person_id, person_data in doc["persons"].items():
+                persons[person_id] = self._deserialize_features(person_data["features"])
+            return persons
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to retrieve all persons: {str(e)}")
+            return {}
+
+    def store_aggregated_log(self, camera_id, person_id, event_type, timestamp=None):
+        """Store logs in the organization's document."""
+        try:
+            if timestamp is None:
+                timestamp = datetime.now(timezone.utc).isoformat()
+
+            doc = self._get_or_create_document(self.logs_container, "logs")
+            if not doc:
+                return False
+
+            if "logs" not in doc:
+                doc["logs"] = []
+
+            doc["logs"].append({
+                "camera_id": camera_id,
+                "person_id": person_id,
+                "event_type": event_type,
+                "timestamp": timestamp
+            })
+
+            self.logs_container.replace_item(item=doc["id"], body=doc)
+            self.logger.info(f"Updated log for camera {camera_id}, person {person_id}, event {event_type}")
             return True
-        except Exception as e:
+        except exceptions.CosmosHttpResponseError as e:
             self.logger.error(f"Failed to store log: {str(e)}")
             return False
 
-    def get_all_person_features(self, token):
-        """Get all person features for the organization."""
+    def get_aggregated_logs(self, camera_id=None):
+        """Retrieve logs from the organization's document."""
         try:
-            org_doc = self.get_org_document(token)
-            
-            all_features = {}
-            for person_id, person_data in org_doc['persons'].items():
-                if person_data['features_history']:
-                    latest_features = person_data['features_history'][-1]['features']
-                    all_features[person_id] = self._deserialize_features(latest_features)
-            
-            return all_features
-        except Exception as e:
-            self.logger.error(f"Failed to get all person features: {str(e)}")
+            doc = self._get_or_create_document(self.logs_container, "logs")
+            if not doc or "logs" not in doc:
+                return []
+
+            if camera_id:
+                return [log for log in doc["logs"] if log["camera_id"] == camera_id]
+            return doc["logs"]
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to retrieve logs: {str(e)}")
+            return []
+
+    def update_counts(self, camera_id, entry_count, exit_count):
+        """Update counts in the organization's document."""
+        try:
+            doc = self._get_or_create_document(self.counts_container, "counts")
+            if not doc:
+                return False
+
+            if "cameras" not in doc:
+                doc["cameras"] = {}
+
+            doc["cameras"][str(camera_id)] = {
+                "entry": int(entry_count),
+                "exit": int(exit_count),
+                "last_updated": datetime.now(timezone.utc).isoformat()
+            }
+
+            self.counts_container.replace_item(item=doc["id"], body=doc)
+            self.logger.info(f"Updated counts for camera {camera_id}")
+            return True
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to update counts: {str(e)}")
+            return False
+
+    def get_all_counts(self):
+        """Retrieve all counts from the organization's document."""
+        try:
+            doc = self._get_or_create_document(self.counts_container, "counts")
+            if not doc or "cameras" not in doc:
+                return {}
+
+            counts = {}
+            for camera_id, camera_data in doc["cameras"].items():
+                counts[camera_id] = {
+                    "entry": camera_data["entry"],
+                    "exit": camera_data["exit"]
+                }
+            return counts
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to retrieve counts: {str(e)}")
             return {}
+
+    def _serialize_features(self, features):
+        """Convert numpy array to list for JSON serialization."""
+        return features.tolist() if isinstance(features, np.ndarray) else features
+
+    def _deserialize_features(self, features):
+        """Convert list back to numpy array."""
+        return np.array(features)
+
+    def cleanup_old_records(self, days_to_keep=30):
+        """Clean up old records from the organization's documents."""
+        try:
+            cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).isoformat()
+            
+            # Clean up person features
+            doc = self._get_or_create_document(self.container, "person_features")
+            if doc and "persons" in doc:
+                doc["persons"] = {
+                    pid: pdata for pid, pdata in doc["persons"].items()
+                    if pdata["timestamp"] >= cutoff_date
+                }
+                self.container.replace_item(item=doc["id"], body=doc)
+
+            # Clean up logs
+            logs_doc = self._get_or_create_document(self.logs_container, "logs")
+            if logs_doc and "logs" in logs_doc:
+                logs_doc["logs"] = [
+                    log for log in logs_doc["logs"]
+                    if log["timestamp"] >= cutoff_date
+                ]
+                self.logs_container.replace_item(item=logs_doc["id"], body=logs_doc)
+
+            self.logger.info(f"Cleaned up records older than {days_to_keep} days")
+            return True
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to clean up old records: {str(e)}")
+            return False
