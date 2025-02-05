@@ -192,6 +192,17 @@ class ReIDDatabase:
         except exceptions.CosmosHttpResponseError as e:
             self.logger.error(f"Failed to retrieve logs: {str(e)}")
             return []
+    def get_camera_setup_details(self):
+        """Retrieve camera setup details from the `setup-details` container."""
+        try:
+            query = "SELECT * FROM c"
+            items = self.setup_container.query_items(query, enable_cross_partition_query=True)
+            for item in items:
+                return item  # Assuming there is one setup detail document
+            return {}
+        except exceptions.CosmosHttpResponseError as e:
+            self.logger.error(f"Failed to retrieve camera setup details: {str(e)}")
+            return {}    
 
     def update_counts(self, camera_id, entry_count, exit_count):
         """Update counts in the organization's document."""

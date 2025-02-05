@@ -14,9 +14,10 @@ import faiss
 import os
 import logging
 import json
+from dotenv import load_dotenv
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
+load_dotenv()
 class FeatureExtractor:
     """Extract deep ReID features using a pre-trained model from torchreid."""
     def __init__(self, model_name='osnet_x1_0', feature_dim=512):
@@ -119,7 +120,7 @@ class MultiCameraTracker:
         )
 
     def _compute_similarity(self, features):
-        """Find the most similar feature vector in the HNSW index."""
+        """Find the most similar feature ve ctor in the HNSW index."""
         features = features / np.linalg.norm(features)
         k = min(4, self.hnsw_index.ntotal)  # Adjust k based on index size
         if k == 0:
@@ -363,7 +364,7 @@ async def main():
     logger = logging.getLogger(__name__)
     
     try:
-        db_connection_string = "AccountEndpoint=https://occupancytrackerdb.documents.azure.com:443/;AccountKey=NTTvzWNTTmZ3I0rydqqnIIjPDGG5RxXVCYa9WS78XK4PvUXUGCS9Tx9s8xnfs4rSfS2xD2deHAGUACDbIMdVxA==;"
+        db_connection_string = os.getenv('COSMOS_DB_CONNECTION_STRING')
         db_handler = ReIDDatabase(db_connection_string)
         
         # Fetch camera setup details
