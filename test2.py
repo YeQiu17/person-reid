@@ -1,3 +1,4 @@
+import cv2
 import torch
 import numpy as np
 from torchvision import transforms
@@ -14,12 +15,83 @@ import os
 import logging
 import json
 from dotenv import load_dotenv
-import cv2
+from scipy.optimize import linear_sum_assignment
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 load_dotenv()
 
+class LocalTracker:
+    """Handle local tracking using Hungarian algorithm."""
+    def __init__(self, max_age=50, min_similarity=0.6):
+        self.max_age = max_age
+        self.min_similarity = min_similarity
+        self.tracks = {}
+        self.age = defaultdict(int)
+        
+    def compute_cost_matrix(self, current_features, tracked_features):
+        """Compute cost matrix based on feature similarity."""
+        cost_matrix = np.zeros((len(current_features), len(tracked_features)))
+        for i, feat1 in enumerate(current_features):
+            for j, feat2 in enumerate(tracked_features):
+                similarity = np.dot(feat1, feat2)
+                cost_matrix[i, j] = 1 - similarity
+        return cost_matrix
+        
+    def update(self, detections, features):
+        if not self.tracks:
+            for i, (det, feat) in enumerate(zip(detections, features)):
+                self.tracks[i] = {
+                    'detection': det,
+                    'feature': feat,
+                    'age': 0
+                }
+            return list(self.tracks.keys())
+            
+        current_features = features
+        tracked_features = [track['feature'] for track in self.tracks.values()]
+        
+        if not tracked_features or not current_features:
+            return []
+            
+        cost_matrix = self.compute_cost_matrix(current_features, tracked_features)
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        assignments = []
+        unmatched_detections = []
+        matched_track_ids = set()
+        
+        for i, j in zip(row_ind, col_ind):
+            if cost_matrix[i, j] < 1 - self.min_similarity:
+                track_id = list(self.tracks.keys())[j]
+                assignments.append((i, track_id))
+                matched_track_ids.add(track_id)
+                self.tracks[track_id] = {
+                    'detection': detections[i],
+                    'feature': features[i],
+                    'age': 0
+                }
+            else:
+                unmatched_detections.append(i)
+        
+        next_id = max(self.tracks.keys(), default=-1) + 1
+        for i in unmatched_detections:
+            self.tracks[next_id] = {
+                'detection': detections[i],
+                'feature': features[i],
+                'age': 0
+            }
+            next_id += 1
+            
+        track_ids = list(self.tracks.keys())
+        for track_id in track_ids:
+            if track_id not in matched_track_ids:
+                self.tracks[track_id]['age'] += 1
+                if self.tracks[track_id]['age'] > self.max_age:
+                    del self.tracks[track_id]
+                    
+        return [track_id for _, track_id in assignments] + list(range(next_id - len(unmatched_detections), next_id))
+
 class FeatureExtractor:
-    """Extract deep ReID features using a pre-trained model from torchreid."""
     def __init__(self, model_name='osnet_x1_0', feature_dim=512):
         self.feature_dim = feature_dim
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -50,26 +122,54 @@ class MultiCameraTracker:
         self.feature_extractor = FeatureExtractor()
         self.db = ReIDDatabase(db_connection_string)
 
+        # Existing tracking-related attributes
         self.persons = {}
         self.camera_persons = defaultdict(dict)
         self.recent_global_ids = deque(maxlen=100)
-        self.camera_trackers = {}
+        self.local_trackers = {}
         self.match_threshold = 0.7
         self.feature_history = defaultdict(lambda: deque(maxlen=10))
         self.keypoints_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=30)))
         
-        dim = self.feature_extractor.feature_dim
-        self.hnsw_index = faiss.IndexHNSWFlat(dim, 32)
-        self.hnsw_index.hnsw.efConstruction = 40
-        self.hnsw_index.hnsw.efSearch = 16
+        # New attributes for improved tracking stability
+        self.id_stability_threshold = 0.6
+        self.feature_buffer_size = 5
+        self.feature_buffers = defaultdict(lambda: deque(maxlen=self.feature_buffer_size))
+        self.id_confidence = defaultdict(float)
+        self.min_frames_for_global_id = 3
+        self.temporal_consistency_window = 5
+        self.temporal_matches = defaultdict(lambda: deque(maxlen=self.temporal_consistency_window))
+        
+        # Initialize FAISS index
+        self.initialize_faiss_index()
         
         self.person_id_map = {}
         self.entry_exit_counts = defaultdict(lambda: {"entry": 0, "exit": 0})
 
         self._initialize_cameras(camera_details)
 
+    def _compute_similarity(self, feature1, feature2):
+        """Compute cosine similarity between features."""
+        return np.dot(feature1, feature2) / (np.linalg.norm(feature1) * np.linalg.norm(feature2))
+
+    def _update_feature_buffer(self, global_id, feature):
+        """Update the feature buffer for a given ID and return the average feature."""
+        self.feature_buffers[global_id].append(feature)
+        return np.mean(self.feature_buffers[global_id], axis=0)
+
+    def initialize_faiss_index(self):
+        """Initialize CPU FAISS index."""
+        dim = self.feature_extractor.feature_dim
+        try:
+            self.faiss_index = faiss.IndexHNSWFlat(dim, 32)
+            self.faiss_index.hnsw.efConstruction = 40
+            self.faiss_index.hnsw.efSearch = 16
+            logging.info("Successfully initialized CPU FAISS index")
+        except Exception as e:
+            logging.error(f"Failed to initialize FAISS index: {str(e)}")
+            raise
+
     def _initialize_cameras(self, camera_details):
-        """Parse camera details and initialize trackers and zones."""
         self.index_to_camera_id = {}
         for i, camera in enumerate(camera_details['cameraDetails']):
             entrance_name = camera['entranceName']
@@ -81,122 +181,10 @@ class MultiCameraTracker:
             self.camera_urls.append(video_url)
             self.camera_positions[camera_id] = camera_position
             self.door_zones[camera_id] = door_coords
-            self.camera_trackers[camera_id] = DeepSort(max_age=50, n_init=5, nms_max_overlap=0.6, max_cosine_distance=0.4)
+            self.local_trackers[camera_id] = LocalTracker()
             self.index_to_camera_id[i] = camera_id
 
-    async def initialize_state_from_db(self):
-        """Initialize the HNSW index and local state from the database."""
-        counts = self.db.get_all_counts()
-        for camera_id, count_data in counts.items():
-            self.entry_exit_counts[camera_id]["entry"] = count_data.get("entry", 0)
-            self.entry_exit_counts[camera_id]["exit"] = count_data.get("exit", 0)
-
-        all_persons = self.db.get_all_persons()
-        feature_batch = []
-        person_ids = []
-        
-        for person_id, features in all_persons.items():
-            person_id = int(person_id)
-            features = np.array(features, dtype=np.float32)
-            feature_batch.append(features)
-            person_ids.append(person_id)
-            self.persons[person_id] = {"features": features, "history": set()}
-
-        if feature_batch:
-            feature_batch = np.array(feature_batch, dtype=np.float32)
-            self.hnsw_index.add(feature_batch)
-            for i, person_id in enumerate(person_ids):
-                self.person_id_map[i] = person_id
-
-    async def update_counts_in_db(self, camera_id):
-        """Update counts in the database for a specific camera."""
-        self.db.update_counts(
-            camera_id,
-            self.entry_exit_counts[camera_id]["entry"],
-            self.entry_exit_counts[camera_id]["exit"]
-        )
-
-    def _compute_similarity(self, features):
-        """Find the most similar feature vector in the HNSW index."""
-        features = features / np.linalg.norm(features)
-        k = min(4, self.hnsw_index.ntotal)
-        if k == 0:
-            return None, float('inf')
-        
-        distances, indices = self.hnsw_index.search(np.array([features], dtype=np.float32), k)
-        return indices[0][0], distances[0][0]
-
-    async def _find_or_create_person(self, features, camera_id):
-        """Find a matching person or create a new one using HNSW index."""
-        if features is None:
-            return None
-
-        matched_person_id = None
-        best_match_score = -1
-
-        if self.hnsw_index.ntotal > 0:
-            index, distance = self._compute_similarity(features)
-            if index is not None and distance < self.match_threshold:
-                matched_person_id = self.person_id_map.get(index)
-                if matched_person_id is not None:
-                    db_features = self.db.get_person_features(matched_person_id)
-                    if db_features is not None:
-                        similarity = np.dot(features, np.array(db_features).T)
-                        if similarity > best_match_score:
-                            best_match_score = similarity
-                            matched_person_id = matched_person_id
-
-        if matched_person_id is not None:
-            self.persons[matched_person_id]["history"].add(camera_id)
-            if matched_person_id not in self.recent_global_ids:
-                self.recent_global_ids.append(matched_person_id)
-            return matched_person_id
-
-        new_id = max(self.persons.keys(), default=0) + 1
-        self.feature_history[new_id].append(features)
-        
-        self.hnsw_index.add(np.array([features], dtype=np.float32))
-        self.person_id_map[self.hnsw_index.ntotal - 1] = new_id
-        
-        self.db.store_person(new_id, features.tolist(), camera_id)
-        self.persons[new_id] = {"features": features, "history": {camera_id}}
-        self.recent_global_ids.append(new_id)
-        return new_id
-
-    def get_pose_center(self, keypoints):
-        """Calculate the center point based on pose keypoints."""
-        valid_keypoints = keypoints[keypoints[:, 2] > 0.5]
-        if len(valid_keypoints) > 0:
-            return np.mean(valid_keypoints[:, :2], axis=0)
-        return None
-
-    def calculate_movement_direction(self, current_keypoints, history_keypoints):
-        """Calculate movement direction using pose keypoint history."""
-        if len(history_keypoints) < 2:
-            return None
-
-        current_center = self.get_pose_center(current_keypoints)
-        past_center = self.get_pose_center(history_keypoints[-2])
-
-        if current_center is not None and past_center is not None:
-            movement = current_center - past_center
-            if np.linalg.norm(movement) > 5:
-                return movement
-        return None
-
-    def is_inside_zone(self, keypoints, door_zone):
-        """Check if person's keypoints are inside the door zone."""
-        (x_min, y_min), (x_max, y_max) = door_zone
-        center = self.get_pose_center(keypoints)
-        if center is None:
-            return False
-
-        x, y = center
-        margin = 20
-        return (x_min - margin <= x <= x_max + margin) and (y_min - margin <= y <= y_max + margin)
-
     def _preprocess_image(self, person_img):
-        """Preprocess image for feature extraction."""
         person_img = cv2.cvtColor(person_img, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(person_img)
         transform = transforms.Compose([
@@ -207,9 +195,13 @@ class MultiCameraTracker:
         return transform(pil_img).unsqueeze(0)
 
     async def process_frame(self, frame, camera_id):
-        """Process a single frame with both YOLO and pose detection."""
         yolo_results = self.yolo_model.predict(frame, conf=self.detection_confidence, classes=0)
         pose_results = self.pose_model(frame, conf=self.detection_confidence)
+
+        detections = []
+        features = []
+        boxes = []
+        keypoints_list = []
 
         if pose_results and hasattr(pose_results[0], 'keypoints') and len(pose_results[0].keypoints) > 0:
             keypoints_data = pose_results[0].keypoints.data
@@ -228,40 +220,219 @@ class MultiCameraTracker:
                     continue
 
                 person_img_tensor = self._preprocess_image(person_img)
-                features = self.feature_extractor.extract(person_img_tensor)
-                if features is None or features.size == 0:
+                feature = self.feature_extractor.extract(person_img_tensor)
+                
+                if feature is None or feature.size == 0:
                     continue
+                    
+                detections.append(([x1, y1, x2-x1, y2-y1], float(box.conf), 'person'))
+                features.append(feature)
+                boxes.append([x1, y1, x2, y2])
+                keypoints_list.append(keypoints)
 
-                global_id = await self._find_or_create_person(features, camera_id)
-                self.keypoints_history[camera_id][global_id].append(keypoints)
+        if not detections:
+            return frame
 
-                movement = self.calculate_movement_direction(
-                    keypoints, list(self.keypoints_history[camera_id][global_id])
-                )
+        # Local tracking
+        local_ids = self.local_trackers[camera_id].update(detections, features)
 
-                door_zone = self.door_zones[camera_id]
-                position = self.camera_positions[camera_id]
+        # Global ReID with improved stability
+        for idx, (local_id, (detection, feature, box, keypoints)) in enumerate(zip(local_ids, zip(detections, features, boxes, keypoints_list))):
+            x1, y1, w, h = detection[0]
+            
+            # First, check if there's a recent match in our feature buffers
+            best_match_id = None
+            best_match_similarity = -1
 
-                in_zone = self.is_inside_zone(keypoints, door_zone)
-                was_in_zone = len(self.keypoints_history[camera_id][global_id]) > 1 and self.is_inside_zone(
-                    self.keypoints_history[camera_id][global_id][-2], door_zone
-                )
+            for existing_id, feature_buffer in self.feature_buffers.items():
+                if len(feature_buffer) > 0:
+                    avg_feature = np.mean(feature_buffer, axis=0)
+                    similarity = self._compute_similarity(feature, avg_feature)
+                    
+                    if similarity > self.id_stability_threshold and similarity > best_match_similarity:
+                        best_match_similarity = similarity
+                        best_match_id = existing_id
 
-                if movement is not None:
-                    if position == 'inside-out':
-                        if not was_in_zone and in_zone and movement[1] > 10:
-                            self.entry_exit_counts[camera_id]["exit"] += 1
-                            await self.update_counts_in_db(camera_id)
-                        elif was_in_zone and not in_zone and movement[1] < -10:
-                            self.entry_exit_counts[camera_id]["entry"] += 1
-                            await self.update_counts_in_db(camera_id)
-                    elif position == 'outside-in':
-                        if not was_in_zone and in_zone and movement[1] < -10:
-                            self.entry_exit_counts[camera_id]["entry"] += 1
-                            await self.update_counts_in_db(camera_id)
-                        elif was_in_zone and not in_zone and movement[1] > 10:
-                            self.entry_exit_counts[camera_id]["exit"] += 1
-                            await self.update_counts_in_db(camera_id)
+            # If no good match in buffer, try FAISS
+            if best_match_id is None:
+                D, I = self.faiss_index.search(np.array([feature], dtype=np.float32), 1)
+                if D[0][0] < 1 - self.match_threshold and I[0][0] < self.faiss_index.ntotal:
+                    potential_id = self.person_id_map.get(I[0][0])
+                    if potential_id is not None:
+                        best_match_id = potential_id
+
+            # Update temporal consistency
+            if best_match_id is not None:
+                self.temporal_matches[local_id].append(best_match_id)
+                # Check if this ID has been consistently matched
+                if len(self.temporal_matches[local_id]) >= self.temporal_consistency_window:
+                    most_common_id = max(set(self.temporal_matches[local_id]), 
+                                       key=self.temporal_matches[local_id].count)
+                    if self.temporal_matches[local_id].count(most_common_id) >= self.temporal_consistency_window * 0.8:
+                        best_match_id = most_common_id
+
+            # Assign or create ID
+            if best_match_id is not None:
+                global_id = best_match_id
+                self._update_feature_buffer(global_id, feature)
+                self.id_confidence[global_id] += 1
+            else:
+                # Only create new ID if we have enough confidence
+                if len(self.feature_buffers) == 0 or \
+                   all(len(buff) >= self.min_frames_for_global_id for buff in self.feature_buffers.values()):
+                    global_id = max(self.persons.keys(), default=0) + 1
+                    self._update_feature_buffer(global_id, feature)
+                    self.id_confidence[global_id] = 1
+                    
+                    # Add to FAISS index
+                    self.faiss_index.add(np.array([feature], dtype=np.float32))
+                    self.person_id_map[self.faiss_index.ntotal - 1] = global_id
+                    self.persons[global_id] = {"features": feature, "history": {camera_id}}
+                    self.db.store_person(global_id, feature.tolist(), camera_id)
+                else:
+                    continue  # Skip this detection until we're more confident
+
+            # Update keypoints history and process movement
+            self.keypoints_history[camera_id][global_id].append(keypoints)
+            movement = self.calculate_movement_direction(
+                keypoints,
+                list(self.keypoints_history[camera_id][global_id])
+            )
+
+            # Process transitions
+            door_zone = self.door_zones[camera_id]
+            position = self.camera_positions[camera_id]
+            
+            in_zone = self.is_inside_zone(keypoints, door_zone)
+            was_in_zone = len(self.keypoints_history[camera_id][global_id]) > 1 and \
+                          self.is_inside_zone(self.keypoints_history[camera_id][global_id][-2], door_zone)
+
+            if movement is not None:
+                if position == 'inside-out':
+                    if not was_in_zone and in_zone and movement[1] > 10:
+                        self.entry_exit_counts[camera_id]["exit"] += 1
+                        asyncio.create_task(self.update_counts_in_db(camera_id))
+                    elif was_in_zone and not in_zone and movement[1] < -10:
+                        self.entry_exit_counts[camera_id]["entry"] += 1
+                        asyncio.create_task(self.update_counts_in_db(camera_id))
+                elif position == 'outside-in':
+                    if not was_in_zone and in_zone and movement[1] < -10:
+                        self.entry_exit_counts[camera_id]["entry"] += 1
+                        asyncio.create_task(self.update_counts_in_db(camera_id))
+                    elif was_in_zone and not in_zone and movement[1] > 10:
+                        self.entry_exit_counts[camera_id]["exit"] += 1
+                        asyncio.create_task(self.update_counts_in_db(camera_id))
+
+            # Draw visualizations
+            x1, y1, x2, y2 = box
+            for kp in keypoints:
+                if kp[2] > 0.5:  # Only draw keypoints with high confidence
+                    cv2.circle(frame, (int(kp[0]), int(kp[1])), 3, (0, 255, 0), -1)
+
+            # Draw bounding box and ID
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"ID: {global_id}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # Draw confidence score
+            confidence_score = self.id_confidence[global_id]
+            cv2.putText(frame, f"Conf: {confidence_score:.1f}", (x1, y2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Draw door zone and counts
+        (x_min, y_min), (x_max, y_max) = self.door_zones[camera_id]
+        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
+        cv2.putText(frame, "Door Zone", (x_min, y_min - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        entry_count = self.entry_exit_counts[camera_id]["entry"]
+        exit_count = self.entry_exit_counts[camera_id]["exit"]
+        cv2.putText(frame, f"Entry: {entry_count} | Exit: {exit_count}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        return frame
+
+    def get_pose_center(self, keypoints):
+        valid_keypoints = keypoints[keypoints[:, 2] > 0.5]
+        if len(valid_keypoints) > 0:
+            return np.mean(valid_keypoints[:, :2], axis=0)
+        return None
+
+    def calculate_movement_direction(self, current_keypoints, history_keypoints):
+        if len(history_keypoints) < 2:
+            return None
+
+        current_center = self.get_pose_center(current_keypoints)
+        past_center = self.get_pose_center(history_keypoints[-2])
+
+        if current_center is not None and past_center is not None:
+            movement = current_center - past_center
+            if np.linalg.norm(movement) > 5:  # Minimum movement threshold
+                return movement
+        return None
+
+    def is_inside_zone(self, keypoints, door_zone):
+        (x_min, y_min), (x_max, y_max) = door_zone
+        center = self.get_pose_center(keypoints)
+        if center is None:
+            return False
+
+        x, y = center
+        margin = 20  # Pixel margin around door zone
+        return (x_min - margin <= x <= x_max + margin) and (y_min - margin <= y <= y_max + margin)
+
+    async def update_counts_in_db(self, camera_id):
+        self.db.update_counts(
+            camera_id,
+            self.entry_exit_counts[camera_id]["entry"],
+            self.entry_exit_counts[camera_id]["exit"]
+        )
+
+    async def initialize_state_from_db(self):
+        counts = self.db.get_all_counts()
+        for camera_id, count_data in counts.items():
+            self.entry_exit_counts[camera_id]["entry"] = count_data.get("entry", 0)
+            self.entry_exit_counts[camera_id]["exit"] = count_data.get("exit", 0)
+
+        all_persons = self.db.get_all_persons()
+        feature_batch = []
+        person_ids = []
+        
+        for person_id, features in all_persons.items():
+            person_id = int(person_id)
+            features = np.array(features, dtype=np.float32)
+            feature_batch.append(features)
+            person_ids.append(person_id)
+            self.persons[person_id] = {"features": features, "history": set()}
+
+        if feature_batch:
+            feature_batch = np.array(feature_batch, dtype=np.float32)
+            self.faiss_index.add(feature_batch)
+            for i, person_id in enumerate(person_ids):
+                self.person_id_map[i] = person_id
+
+    def save_index(self, filepath):
+        """Save the FAISS index to disk."""
+        try:
+            faiss.write_index(self.faiss_index, filepath)
+            logging.info(f"Successfully saved FAISS index to {filepath}")
+        except Exception as e:
+            logging.error(f"Failed to save FAISS index: {str(e)}")
+            raise
+
+    def load_index(self, filepath):
+        """Load the FAISS index from disk."""
+        if not os.path.exists(filepath):
+            logging.warning(f"Index file {filepath} not found")
+            return False
+            
+        try:
+            self.faiss_index = faiss.read_index(filepath)
+            logging.info("Successfully loaded CPU FAISS index")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to load FAISS index: {str(e)}")
+            return False
 
     async def run(self):
         """Run the tracker for all cameras."""
@@ -274,21 +445,18 @@ class MultiCameraTracker:
                     self.process_frame(frame, self.index_to_camera_id[i])
                     for i, frame in enumerate(frames) if frame is not None
                 ]
-                await asyncio.gather(*tasks)
+                processed_frames = await asyncio.gather(*tasks)
+                
+                for i, frame in enumerate(processed_frames):
+                    if frame is not None:
+                        cv2.imshow(f"Camera {self.index_to_camera_id[i]}", frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         finally:
             for cap in caps:
                 cap.release()
-            
-    def save_index(self, filepath):
-        """Save the HNSW index to disk."""
-        faiss.write_index(self.hnsw_index, filepath)
-        
-    def load_index(self, filepath):
-        """Load the HNSW index from disk."""
-        if os.path.exists(filepath):
-            self.hnsw_index = faiss.read_index(filepath)
-            return True
-        return False
+            cv2.destroyAllWindows()
 
 class IndexManager:
     """Manage HNSW index persistence and maintenance."""
@@ -298,44 +466,71 @@ class IndexManager:
     async def periodic_index_maintenance(self, tracker, interval_hours=24):
         """Periodically maintain the HNSW index."""
         while True:
+            # Save current index state
             tracker.save_index(self.index_path)
-            if tracker.hnsw_index.ntotal > 1000:
-                pass
+            
+            # Optimize index if needed
+            if tracker.faiss_index.ntotal > 1000:
+                logging.info("Performing index maintenance...")
+                # Add any specific maintenance tasks here
+                
             await asyncio.sleep(interval_hours * 3600)
 
 async def main():
+    # Initialize logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
     logger = logging.getLogger(__name__)
     
+    tracker = None  # Initialize tracker variable in outer scope
+    
     try:
+        # Get database connection string from environment variables
         db_connection_string = os.getenv('COSMOS_DB_CONNECTION_STRING')
+        if not db_connection_string:
+            logger.error("Database connection string not found in environment variables")
+            return
+            
         db_handler = ReIDDatabase(db_connection_string)
         
+        # Fetch camera setup details
         camera_setup_details = db_handler.get_camera_setup_details()
         if not camera_setup_details:
-            logger.error("Failed to fetch camera setup details from the database. Exiting...")
+            logger.error("Failed to fetch camera setup details from the database")
             return
             
         camera_details_json = json.dumps({
             "cameraDetails": camera_setup_details["cameraDetails"]
         })
         
+        # Initialize tracker and index manager
         tracker = MultiCameraTracker(camera_details_json, db_connection_string)
         index_manager = IndexManager("hnsw_index.faiss")
         
+        # Load existing index if available
+        if os.path.exists("hnsw_index.faiss"):
+            logger.info("Loading existing FAISS index...")
+            tracker.load_index("hnsw_index.faiss")
+        
+        # Create tasks for tracker and index maintenance
         tracker_task = asyncio.create_task(tracker.run())
         maintenance_task = asyncio.create_task(
             index_manager.periodic_index_maintenance(tracker)
         )
         
+        # Run both tasks concurrently
         await asyncio.gather(tracker_task, maintenance_task)
         
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
         raise
+    finally:
+        # Cleanup
+        cv2.destroyAllWindows()
+        if tracker:  # Check if tracker was initialized
+            tracker.save_index("hnsw_index.faiss")
 
 if __name__ == "__main__":
     try:
