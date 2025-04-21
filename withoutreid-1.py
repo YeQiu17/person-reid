@@ -344,57 +344,72 @@ class UserCameraProcessor:
 
     async def _process_cameras(self):
         """Process all cameras for this user."""
-        caps = [cv2.VideoCapture(url) for url in self.tracker.camera_urls]
-        # Set camera resolution
-        for cap in caps:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.tracker.target_resolution[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.tracker.target_resolution[1])
-        
+        caps = self._initialize_cameras()
         camera_active = [True] * len(caps)
-        
+
         try:
             while self.is_running and any(camera_active):
-                frames = []
-                for i, cap in enumerate(caps):
-                    if camera_active[i]:
-                        ret, frame = cap.read()
-                        if not ret:
-                            camera_active[i] = False
-                            window_name = f"User {self.user_id} - Camera {self.tracker.index_to_camera_id[i]}"
-                            cv2.destroyWindow(window_name)
-                            self.logger.info(f"Video finished for {window_name}")
-                            continue
-                        frames.append((i, frame))
-                        
+                frames = await self._capture_frames(caps, camera_active)
                 if not frames:
                     break
-                    
-                tasks = [
-                    self.tracker.process_frame(frame, self.tracker.index_to_camera_id[i])
-                    for i, frame in frames
-                ]
-                
-                if tasks:
-                    processed_frames = await asyncio.gather(*tasks)
-                    
-                    for i, frame in enumerate(processed_frames):
-                        if frame is not None:
-                            idx = frames[i][0]
-                            window_name = f"User {self.user_id} - Camera {self.tracker.index_to_camera_id[idx]}"
-                            cv2.imshow(window_name, frame)
-                
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                await self._process_and_display_frames(frames)
+                if self._should_stop():
                     break
-                
             self.logger.info(f"All videos finished for user {self.user_id}")
             self.is_running = False
-                
         except Exception as e:
             self.logger.error(f"Error processing cameras for user {self.user_id}: {str(e)}")
         finally:
-            for cap in caps:
-                cap.release()
-            cv2.destroyAllWindows()
+            self._cleanup_cameras(caps)
+
+    def _initialize_cameras(self):
+        """Initialize video capture for all camera URLs."""
+        caps = [cv2.VideoCapture(url) for url in self.tracker.camera_urls]
+        for cap in caps:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.tracker.target_resolution[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.tracker.target_resolution[1])
+        return caps
+
+    async def _capture_frames(self, caps, camera_active):
+        """Capture frames from active cameras."""
+        frames = []
+        for i, cap in enumerate(caps):
+            if not camera_active[i]:
+                continue
+            ret, frame = cap.read()
+            if not ret:
+                camera_active[i] = False
+                window_name = f"User {self.user_id} - Camera {self.tracker.index_to_camera_id[i]}"
+                cv2.destroyWindow(window_name)
+                self.logger.info(f"Video finished for {window_name}")
+                continue
+            frames.append((i, frame))
+        return frames
+
+    async def _process_and_display_frames(self, frames):
+        """Process frames with tracking and display results."""
+        tasks = [
+            self.tracker.process_frame(frame, self.tracker.index_to_camera_id[i])
+            for i, frame in frames
+        ]
+        if not tasks:
+            return
+        processed_frames = await asyncio.gather(*tasks)
+        for i, frame in enumerate(processed_frames):
+            if frame is not None:
+                idx = frames[i][0]
+                window_name = f"User {self.user_id} - Camera {self.tracker.index_to_camera_id[idx]}"
+                cv2.imshow(window_name, frame)
+
+    def _should_stop(self):
+        """Check if the processing should stop based on user input."""
+        return cv2.waitKey(1) & 0xFF == ord('q')
+
+    def _cleanup_cameras(self, caps):
+        """Release camera resources and close windows."""
+        for cap in caps:
+            cap.release()
+        cv2.destroyAllWindows()
 
 class MultiUserTrackingSystem:
     def __init__(self, db_connection_string):
