@@ -2,17 +2,17 @@ import cv2
 import torch
 import numpy as np
 from ultralytics import YOLO
-from deep_sort_realtime.deepsort_tracker import DeepSort
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 import os
 import logging
 import json
 from dotenv import load_dotenv
 from db_handler1 import ReIDDatabase
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-load_dotenv()
+import time
+import socket
 
 class MultiCameraTracker:
     def __init__(self, camera_details_json, db_connection_string):
@@ -20,169 +20,239 @@ class MultiCameraTracker:
         self.camera_urls = []
         self.camera_positions = {}
         self.door_zones = {}
-        self.counting_lines = {}  # Store middle lines for counting
-        self.yolo_model = YOLO('yolov8s.pt')
+        self.counting_lines = {}
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.yolo_model = YOLO('yolov8s.pt').to(self.device)
         self.detection_confidence = 0.7
         self.db = ReIDDatabase(db_connection_string)
-
-        self.camera_trackers = {}
-        self.track_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=30)))
+        self.target_resolution = (1280, 720)
+        self.track_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50)))  # Increased for smoothing
         self.entry_exit_counts = defaultdict(lambda: {"entry": 0, "exit": 0})
-        self.track_line_crossings = defaultdict(dict)  # Track which IDs have crossed the line
+        self.track_line_crossings = defaultdict(dict)
+        self.last_crossing_time = defaultdict(dict)  # For debouncing
         self.db_connection_string = db_connection_string
-
+        self.user_id = None
+        self.camera_details = camera_details
+        self.url_check_task = None
         self._initialize_cameras(camera_details)
 
-    def _initialize_cameras(self, camera_details):
-        """Parse camera details and initialize trackers and zones."""
-        self.index_to_camera_id = {}
-        for i, camera in enumerate(camera_details['cameraDetails']):
-            entrance_name = camera['entranceName']
-            camera_id = entrance_name
-            video_url = camera['videoUrl']
-            door_coords = camera['doorCoordinates']
-            camera_position = camera['cameraPosition']
+    async def start_url_checker(self):
+        """Start periodic camera URL checking."""
+        self.url_check_task = asyncio.create_task(self._periodic_url_check())
 
+    async def _periodic_url_check(self):
+        """Check camera URLs every minute and update if changed."""
+        while True:
+            try:
+                if self.user_id is None:
+                    await asyncio.sleep(60)
+                    continue
+                user_doc = await asyncio.to_thread(self.db.get_user_counts, self.user_id)
+                if not user_doc or "cameraDetails" not in user_doc:
+                    logging.warning(f"No camera details found for user {self.user_id}")
+                    await asyncio.sleep(60)
+                    continue
+                new_camera_details = {"cameraDetails": user_doc["cameraDetails"]}
+                current_urls = {cam["videoUrl"] for cam in self.camera_details["cameraDetails"]}
+                new_urls = {cam["videoUrl"] for cam in new_camera_details["cameraDetails"]}
+                if current_urls != new_urls or len(self.camera_details["cameraDetails"]) != len(new_camera_details["cameraDetails"]):
+                    logging.info(f"Camera details changed for user {self.user_id}. Reinitializing cameras.")
+                    self.camera_details = new_camera_details
+                    self._initialize_cameras(new_camera_details)
+                    logging.info(f"New camera URLs: {new_urls}")
+                else:
+                    logging.debug(f"No changes in camera URLs for user {self.user_id}")
+            except Exception as e:
+                logging.error(f"Error checking camera URLs for user {self.user_id}: {str(e)}")
+            await asyncio.sleep(60)
+
+    def _initialize_cameras(self, camera_details):
+        """Parse camera details and initialize zones."""
+        self.index_to_camera_id = {}
+        self.camera_urls = []
+        for i, camera in enumerate(camera_details['cameraDetails']):
+            entrance_name = camera.get('entranceName')
+            if not entrance_name:
+                logging.error(f"Camera at index {i} missing 'entranceName'. Skipping.")
+                continue
+            camera_id = entrance_name
+            video_url = camera.get('videoUrl')
+            if not video_url:
+                logging.error(f"Camera {camera_id} missing 'videoUrl'. Skipping.")
+                continue
+            door_coords = camera.get('doorCoordinates')
+            if not door_coords or not isinstance(door_coords, (list, tuple)) or len(door_coords) != 2:
+                logging.error(f"Camera {camera_id} has invalid 'doorCoordinates': {door_coords}. Skipping.")
+                continue
+            try:
+                (x_min, y_min), (x_max, y_max) = door_coords
+                if not all(isinstance(coord, (int, float)) for coord in [x_min, y_min, x_max, y_max]):
+                    logging.error(f"Camera {camera_id} has non-numeric coordinates: {door_coords}. Skipping.")
+                    continue
+            except (ValueError, TypeError) as e:
+                logging.error(f"Camera {camera_id} failed to unpack 'doorCoordinates': {door_coords}. Error: {str(e)}. Skipping.")
+                continue
+            camera_position = camera.get('cameraPosition')
+            if not camera_position:
+                logging.error(f"Camera {camera_id} missing 'cameraPosition'. Skipping.")
+                continue
             self.camera_urls.append(video_url)
             self.camera_positions[camera_id] = camera_position
             self.door_zones[camera_id] = door_coords
-            
-            # Calculate middle line for counting
-            (x_min, y_min), (x_max, y_max) = door_coords
             middle_y = (y_min + y_max) // 2
             self.counting_lines[camera_id] = {
                 'line': ((x_min, middle_y), (x_max, middle_y)),
                 'zone_height': y_max - y_min
             }
-
-            self.camera_trackers[camera_id] = DeepSort(
-                max_age=50,
-                n_init=5,
-                nms_max_overlap=0.6,
-                max_cosine_distance=0.3,
-                nn_budget=100
-            )
             self.index_to_camera_id[i] = camera_id
+        if not self.camera_urls:
+            logging.warning("No valid cameras initialized.")
 
-    async def initialize_state_from_db(self):
+    async def initialize_state_from_db(self, user_id):
         """Initialize counts from the database."""
-        counts = self.db.get_all_counts()
-        for camera_id, count_data in counts.items():
-            self.entry_exit_counts[camera_id]["entry"] = count_data.get("entry", 0)
-            self.entry_exit_counts[camera_id]["exit"] = count_data.get("exit", 0)
-
-    async def update_counts_in_db(self, camera_id):
-        """Update counts in the database for a specific camera."""
-        self.db.update_counts(
-            camera_id,
-            self.entry_exit_counts[camera_id]["entry"],
-            self.entry_exit_counts[camera_id]["exit"]
-        )
+        self.user_id = user_id
+        user_data = await asyncio.to_thread(self.db.get_user_counts, user_id)
+        if user_data and "cameras" in user_data:
+            for camera_id, camera_data in user_data["cameras"].items():
+                self.entry_exit_counts[camera_id] = {
+                    "entry": camera_data.get("entry_count", 0),
+                    "exit": camera_data.get("exit_count", 0)
+                }
+        await self.start_url_checker()
 
     def is_inside_zone(self, bbox, door_zone):
         """Check if a bounding box is inside the door zone."""
         x1, y1, x2, y2 = bbox
         (zone_x_min, zone_y_min), (zone_x_max, zone_y_max) = door_zone
-        
-        # Calculate the center of the bounding box
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
-        
-        # Check if the center point is inside the door zone
         return (zone_x_min <= center_x <= zone_x_max) and (zone_y_min <= center_y <= zone_y_max)
 
-    def check_line_crossing(self, point, prev_point, line):
-        """Check if a point has crossed the counting line."""
-        if prev_point is None:
-            return None
+    def _smooth_trajectory(self, history, window_size=5):
+        """Apply moving average to smooth track trajectory."""
+        if len(history) < 2:
+            return list(history)[-1] if history else None
+        points = np.array(list(history))
+        smoothed = np.zeros(2)
+        weights = np.ones(min(len(points), window_size)) / min(len(points), window_size)
+        smoothed[0] = np.convolve(points[:, 0], weights, mode='valid')[-1]
+        smoothed[1] = np.convolve(points[:, 1], weights, mode='valid')[-1]
+        return tuple(smoothed.astype(int))
 
-        line_y = line[0][1]  # Y-coordinate of the horizontal line
-        
-        # Check if the point crossed the line from either direction
-        if (prev_point[1] <= line_y <= point[1]) or (point[1] <= line_y <= prev_point[1]):
-            # Calculate x-coordinate where crossing occurred
-            if point[1] != prev_point[1]:  # Avoid division by zero
-                slope = (point[0] - prev_point[0]) / (point[1] - prev_point[1])
-                x_cross = prev_point[0] + slope * (line_y - prev_point[1])
-                
-                # Check if crossing point is within line segment
-                if line[0][0] <= x_cross <= line[1][0]:
-                    # Determine direction of crossing
-                    return "down" if prev_point[1] < point[1] else "up"
-        
+    def check_line_crossing(self, history, line):
+        """Check if a track has crossed the counting line using multiple points."""
+        if len(history) < 3:  # Require at least 3 points for reliable crossing
+            return None
+        line_y = line[0][1]
+        recent_points = list(history)[-3:]  # Analyze last 3 points
+        for i in range(len(recent_points) - 1):
+            point = recent_points[i + 1]
+            prev_point = recent_points[i]
+            if (prev_point[1] <= line_y <= point[1]) or (point[1] <= line_y <= prev_point[1]):
+                if point[1] != prev_point[1]:
+                    slope = (point[0] - prev_point[0]) / (point[1] - prev_point[1])
+                    x_cross = prev_point[0] + slope * (line_y - prev_point[1])
+                    if line[0][0] <= x_cross <= line[1][0]:
+                        return "down" if prev_point[1] < point[1] else "up"
         return None
 
     def _get_detections_from_yolo(self, frame, door_zone):
-        """Process YOLO detections for a frame, only within door zone."""
-        results = self.yolo_model(frame, conf=self.detection_confidence, classes=0)
+        """Process YOLO detections with BoTSORT tracking."""
+        results = self.yolo_model.track(
+            source=frame,
+            conf=self.detection_confidence,
+            classes=0,
+            device=self.device,
+            tracker="botsort.yaml"
+        )
         detections = []
-        
         if results and len(results[0].boxes) > 0:
             for box in results[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                 conf = float(box.conf)
-                
+                track_id = int(box.id) if box.id is not None else -1
                 if conf < self.detection_confidence:
                     continue
-                    
-                # Only include detections inside the door zone
                 if self.is_inside_zone((x1, y1, x2, y2), door_zone):
                     w, h = x2 - x1, y2 - y1
-                    if w * h >= 100:  # Filter out small detections
-                        detections.append(([x1, y1, w, h], conf, None))
-                
+                    if w * h >= 100:
+                        detections.append([x1, y1, x2, y2, conf, track_id])
         return detections
 
     def _process_crossing(self, track_id, crossing_direction, camera_id):
-        """Process line crossing and update counts."""
+        """Process line crossing and update counts with debouncing."""
+        current_time = time.time()
+        if track_id in self.last_crossing_time[camera_id]:
+            if current_time - self.last_crossing_time[camera_id][track_id] < 2.0:  # 2-second debounce
+                return False, None
+        self.last_crossing_time[camera_id][track_id] = current_time
         if track_id not in self.track_line_crossings[camera_id]:
             self.track_line_crossings[camera_id][track_id] = crossing_direction
-            
             position = self.camera_positions[camera_id]
+            event_type = None
             if position == 'inside-out':
                 if crossing_direction == "down":
                     self.entry_exit_counts[camera_id]["exit"] += 1
-                    return True
+                    event_type = "person_exit"
+                    return True, event_type
                 elif crossing_direction == "up":
                     self.entry_exit_counts[camera_id]["entry"] += 1
-                    return True
-            elif position == 'outside-in':  # outside-in
+                    event_type = "person_entry"
+                    return True, event_type
+            elif position == 'outside-in':
                 if crossing_direction == "up":
                     self.entry_exit_counts[camera_id]["exit"] += 1
-                    return True
+                    event_type = "person_exit"
+                    return True, event_type
                 elif crossing_direction == "down":
                     self.entry_exit_counts[camera_id]["entry"] += 1
-                    return True
-        
-        return False
+                    event_type = "person_entry"
+                    return True, event_type
+        return False, None
+
+    async def update_counts(self, camera_id, counts=None, track_id=None, event_type=None):
+        """Update the database with the latest counts for the current user."""
+        if self.user_id is None:
+            return
+        try:
+            if counts is None:
+                counts = self.entry_exit_counts[camera_id]
+            entry_count = counts["entry"]
+            exit_count = counts["exit"]
+            await asyncio.to_thread(
+                self.db.update_user_counts,
+                self.user_id,
+                camera_id,
+                entry_count,
+                exit_count
+            )
+            if event_type is None:
+                event_type = "count_update"
+            system_id = str(track_id) if track_id is not None else "system"
+            await asyncio.to_thread(
+                self.db.store_user_log,
+                self.user_id,
+                camera_id,
+                system_id,
+                event_type
+            )
+        except Exception as e:
+            logging.error(f"Error updating counts for user {self.user_id}: {str(e)}")
 
     def _draw_visualizations(self, frame, camera_id, tracks):
         """Draw tracking visualizations on the frame."""
-        # Draw door zone
         (x_min, y_min), (x_max, y_max) = self.door_zones[camera_id]
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
-        
-        # Draw counting line
         line = self.counting_lines[camera_id]['line']
         cv2.line(frame, line[0], line[1], (255, 0, 0), 2)
         cv2.putText(frame, "Counting Line", (line[0][0], line[0][1] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-        # Draw tracks
         for track in tracks:
-            if not track.is_confirmed():
-                continue
-
-            ltrb = track.to_ltrb()
-            x1, y1, x2, y2 = map(int, ltrb)
-            
-            # Only draw tracks inside door zone
+            x1, y1, x2, y2 = map(int, track.tlbr)
             if self.is_inside_zone((x1, y1, x2, y2), self.door_zones[camera_id]):
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.putText(frame, f"ID: {track.track_id}", (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        # Draw counts
         entry_count = self.entry_exit_counts[camera_id]["entry"]
         exit_count = self.entry_exit_counts[camera_id]["exit"]
         cv2.putText(frame, f"Entry: {entry_count} | Exit: {exit_count}",
@@ -190,114 +260,317 @@ class MultiCameraTracker:
 
     async def _process_track(self, track, camera_id):
         """Process a single track and update counts if needed."""
-        if not track.is_confirmed():
-            return False
-
         track_id = track.track_id
-        ltrb = track.to_ltrb()
+        ltrb = track.tlbr  # Format: [x1, y1, x2, y2]
         x1, y1, x2, y2 = map(int, ltrb)
-        
-        # Only process tracks inside door zone
         if not self.is_inside_zone((x1, y1, x2, y2), self.door_zones[camera_id]):
             return False
-
         center_point = ((x1 + x2) // 2, (y1 + y2) // 2)
-        
-        # Update track history
         history = self.track_history[camera_id][track_id]
-        prev_point = history[-1] if history else None
         history.append(center_point)
-        
-        # Check for line crossing
-        crossing = self.check_line_crossing(
-            center_point, 
-            prev_point, 
-            self.counting_lines[camera_id]['line']
-        )
-        
-        if crossing and self._process_crossing(track_id, crossing, camera_id):
-                await self.update_counts_in_db(camera_id)
+        smoothed_point = self._smooth_trajectory(history)
+        if not smoothed_point:
+            return False
+        crossing = self.check_line_crossing(history, self.counting_lines[camera_id]['line'])
+        if crossing:
+            count_updated, event_type = self._process_crossing(track_id, crossing, camera_id)
+            if count_updated:
+                await self.update_counts(
+                    camera_id,
+                    counts=None,
+                    track_id=track_id,
+                    event_type=event_type
+                )
                 return True
-        
         return False
 
     async def process_frame(self, frame, camera_id):
-        """Process a single frame with YOLO detection and DeepSort tracking.""" 
+        """Process a single frame with YOLO and BoTSORT tracking."""
         if frame is None:
             return None
-
-        # Get YOLO detections only within door zone
+        frame = cv2.resize(frame, self.target_resolution)
         detections = self._get_detections_from_yolo(frame, self.door_zones[camera_id])
-        
-        # Update trackers
-        tracks = self.camera_trackers[camera_id].update_tracks(detections, frame=frame)
-
-        # Process each track
+        tracks = [
+            type('Track', (), {'track_id': det[5], 'tlbr': det[:4]})()  # Mock track object
+            for det in detections if det[5] != -1
+        ]
         track_tasks = [self._process_track(track, camera_id) for track in tracks]
         await asyncio.gather(*track_tasks)
-
-        # Draw visualizations
         self._draw_visualizations(frame, camera_id, tracks)
-
         return frame
 
-    async def run(self):
-        """Run the tracker for all cameras."""
-        await self.initialize_state_from_db()
-        caps = [cv2.VideoCapture(url) for url in self.camera_urls]
-        
+class UserCameraProcessor:
+    def __init__(self, user_id, camera_details, db_connection_string):
+        self.user_id = user_id
+        self.tracker = MultiCameraTracker(camera_details, db_connection_string)
+        self.is_running = False
+        self.thread = None
+        self.db_connection_string = db_connection_string
+        self.logger = logging.getLogger(__name__)
+        self.max_retries = 3
+        self.retry_delay = 1  # seconds
+        self.timeout = 5  # seconds
+
+    async def start(self):
+        """Start processing for this user's cameras."""
+        await self.tracker.initialize_state_from_db(self.user_id)
+        self.is_running = True
+        self.thread = threading.Thread(target=self._run_tracking_loop)
+        self.thread.start()
+
+    def stop(self):
+        """Stop processing for this user's cameras."""
+        self.is_running = False
+        if self.tracker.url_check_task:
+            self.tracker.url_check_task.cancel()
+        if self.thread:
+            self.thread.join()
+
+    def _run_tracking_loop(self):
+        """Run the tracking loop in a separate thread."""
+        asyncio.run(self._process_cameras())
+
+    def _validate_stream(self, url, index):
+        """Validate if a camera stream is accessible."""
         try:
-            while True:
-                frames = [cap.read()[1] for cap in caps]
-                tasks = [
-                    self.process_frame(frame, self.index_to_camera_id[i])
-                    for i, frame in enumerate(frames) if frame is not None
-                ]
-                processed_frames = await asyncio.gather(*tasks)
-                
-                for i, frame in enumerate(processed_frames):
-                    if frame is not None:
-                        cv2.imshow(f"Camera {self.index_to_camera_id[i]}", frame)
-                
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-                    
-        finally:
-            for cap in caps:
+            cap = cv2.VideoCapture(url)
+            if not cap.isOpened():
+                self.logger.error(f"Camera {self.tracker.index_to_camera_id[index]} stream failed to open: {url}")
+                return False, None
+            ret, _ = cap.read()
+            if not ret:
+                self.logger.error(f"Camera {self.tracker.index_to_camera_id[index]} failed to capture initial frame: {url}")
                 cap.release()
-            cv2.destroyAllWindows()
+                return False, None
+            self.logger.info(f"Camera {self.tracker.index_to_camera_id[index]} stream validated: {url}")
+            return True, cap
+        except Exception as e:
+            self.logger.error(f"Camera {self.tracker.index_to_camera_id[index]} stream validation failed: {url}, error: {str(e)}")
+            return False, None
+
+    def _initialize_cameras(self):
+        """Initialize video capture for all camera URLs with validation."""
+        caps = []
+        valid_indices = []
+        for i, url in enumerate(self.tracker.camera_urls):
+            is_valid, cap = self._validate_stream(url, i)
+            if is_valid and cap is not None:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.tracker.target_resolution[0])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.tracker.target_resolution[1])
+                caps.append(cap)
+                valid_indices.append(i)
+            else:
+                self.logger.warning(f"Skipping camera {self.tracker.index_to_camera_id[i]} due to validation failure: {url}")
+        self.tracker.index_to_camera_id = {i: self.tracker.index_to_camera_id[valid_indices[i]] for i in range(len(valid_indices))}
+        return caps
+
+    async def _capture_frame_with_retry(self, cap, camera_id):
+        """Capture a frame with retries and timeout."""
+        start_time = time.time()
+        for attempt in range(self.max_retries):
+            try:
+                socket.setdefaulttimeout(self.timeout)
+                ret, frame = await asyncio.to_thread(cap.read)
+                socket.setdefaulttimeout(None)
+                if ret:
+                    return True, frame
+                self.logger.warning(f"Camera {camera_id} frame capture attempt {attempt + 1} failed: no frame received")
+            except Exception as e:
+                self.logger.error(f"Camera {camera_id} frame capture attempt {attempt + 1} failed: {str(e)}")
+            if time.time() - start_time > self.timeout:
+                self.logger.error(f"Camera {camera_id} frame capture timed out after {self.timeout} seconds")
+                return False, None
+            await asyncio.sleep(self.retry_delay)
+        self.logger.error(f"Camera {camera_id} frame capture failed after {self.max_retries} retries")
+        return False, None
+
+    async def _capture_frames(self, caps, camera_active):
+        """Capture frames from active cameras with retries."""
+        frames = []
+        for i, cap in enumerate(caps):
+            if not camera_active[i]:
+                continue
+            camera_id = self.tracker.index_to_camera_id[i]
+            ret, frame = await self._capture_frame_with_retry(cap, camera_id)
+            if not ret:
+                camera_active[i] = False
+                window_name = f"User {self.user_id} - Camera {camera_id}"
+                cv2.destroyWindow(window_name)
+                if cap.get(cv2.CAP_PROP_POS_FRAMES) >= cap.get(cv2.CAP_PROP_FRAME_COUNT) and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+                    self.logger.info(f"Camera {camera_id} stream ended: reached end of video")
+                else:
+                    self.logger.error(f"Camera {camera_id} stream failed")
+                continue
+            frames.append((i, frame))
+        return frames
+
+    async def _process_and_display_frames(self, frames):
+        """Process frames with tracking and display results."""
+        tasks = [
+            self.tracker.process_frame(frame, self.tracker.index_to_camera_id[i])
+            for i, frame in frames
+        ]
+        if not tasks:
+            return
+        processed_frames = await asyncio.gather(*tasks)
+        for i, frame in enumerate(processed_frames):
+            if frame is not None:
+                idx = frames[i][0]
+                window_name = f"User {self.user_id} - Camera {self.tracker.index_to_camera_id[idx]}"
+                cv2.imshow(window_name, frame)
+
+    def _should_stop(self):
+        """Check if the processing should stop based on user input."""
+        return cv2.waitKey(1) & 0xFF == ord('q')
+
+    def _cleanup_cameras(self, caps):
+        """Release camera resources and close windows."""
+        for cap in caps:
+            cap.release()
+        cv2.destroyAllWindows()
+
+    async def _process_cameras(self):
+        """Process all cameras for this user."""
+        caps = self._initialize_cameras()
+        camera_active = [True] * len(caps)
+        try:
+            while self.is_running and any(camera_active):
+                frames = await self._capture_frames(caps, camera_active)
+                if not frames:
+                    break
+                await self._process_and_display_frames(frames)
+                if self._should_stop():
+                    break
+            self.logger.info(f"All videos finished for user {self.user_id}")
+            self.is_running = False
+        except Exception as e:
+            self.logger.error(f"Error processing cameras for user {self.user_id}: {str(e)}")
+        finally:
+            self._cleanup_cameras(caps)
+
+class MultiUserTrackingSystem:
+    def __init__(self, db_connection_string):
+        self.db = self.db = ReIDDatabase(db_connection_string)
+        self.user_processors = {}
+        self.executor = ThreadPoolExecutor(max_workers=10)
+        self.logger = logging.getLogger(__name__)
+        self.db_connection_string = db_connection_string
+        self.user_check_task = None
+
+    async def initialize(self):
+        """Initialize the system by loading all user documents and starting user check."""
+        try:
+            user_documents = await self.db.get_all_user_documents()
+            for doc in user_documents:
+                user_id = doc["user_id"]
+                camera_details = json.dumps({"cameraDetails": doc["cameraDetails"]})
+                await self.add_user_processor(user_id, camera_details)
+            self.user_check_task = asyncio.create_task(self._periodic_user_check())
+        except Exception as e:
+            self.logger.error(f"Failed to initialize system: {str(e)}")
+            raise
+
+    async def _periodic_user_check(self):
+        """Check for new user documents every minute."""
+        while True:
+            try:
+                user_documents = await self.db.get_all_user_documents()
+                current_user_ids = set(self.user_processors.keys())
+                new_user_ids = {doc["user_id"] for doc in user_documents}
+                for doc in user_documents:
+                    user_id = doc["user_id"]
+                    if user_id not in current_user_ids:
+                        self.logger.info(f"New user document found: {user_id}")
+                        camera_details = json.dumps({"cameraDetails": doc["cameraDetails"]})
+                        await self.add_user_processor(user_id, camera_details)
+                for user_id in current_user_ids:
+                    if user_id not in new_user_ids:
+                        self.logger.info(f"User document removed: {user_id}")
+                        await self.stop_user_processor(user_id)
+            except Exception as e:
+                self.logger.error(f"Error checking for new user documents: {str(e)}")
+            await asyncio.sleep(60)
+
+    async def add_user_processor(self, user_id, camera_details):
+        """Add or update a user processor."""
+        if user_id in self.user_processors:
+            await self.stop_user_processor(user_id)
+        processor = UserCameraProcessor(user_id, camera_details, self.db_connection_string)
+        self.user_processors[user_id] = processor
+        await processor.start()
+
+    async def stop_user_processor(self, user_id):
+        """Stop processing for a specific user."""
+        if user_id in self.user_processors:
+            self.user_processors[user_id].stop()
+            del self.user_processors[user_id]
+
+    async def stop_all(self):
+        """Stop all user processors and clean up."""
+        if self.user_check_task:
+            self.user_check_task.cancel()
+        for user_id in list(self.user_processors.keys()):
+            await self.stop_user_processor(user_id)
+        self.executor.shutdown()
+        cv2.destroyAllWindows()
+
+    async def get_user_statistics(self, user_id):
+        """Get statistics for a specific user."""
+        try:
+            counts = await asyncio.to_thread(self.db.get_user_total_counts, user_id)
+            logs = await asyncio.to_thread(self.db.get_user_logs, user_id, 50)
+            recent_activity = {}
+            if logs:
+                for log in logs:
+                    camera_id = log.get("camera_id")
+                    event_type = log.get("event_type")
+                    if camera_id not in recent_activity:
+                        recent_activity[camera_id] = {
+                            "person_entry": 0,
+                            "person_exit": 0,
+                            "count_update": 0
+                        }
+                    if event_type in recent_activity[camera_id]:
+                        recent_activity[camera_id][event_type] += 1
+            return {
+                "counts": counts,
+                "recent_activity": recent_activity,
+                "recent_logs": logs[:10]
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get statistics for user {user_id}: {str(e)}")
+            return {
+                "counts": {"total_entry": 0, "total_exit": 0, "camera_count": 0},
+                "recent_activity": {},
+                "recent_logs": []
+            }
 
 async def main():
-    # Initialize logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('multi_user_tracking.log'),
+            logging.StreamHandler()
+        ]
     )
     logger = logging.getLogger(__name__)
-    
     try:
+        load_dotenv()
         db_connection_string = os.getenv('COSMOS_DB_CONNECTION_STRING')
-        db_handler = ReIDDatabase(db_connection_string)
-        
-        # Fetch camera setup details from database
-        camera_setup_details = db_handler.get_camera_setup_details()
-        if not camera_setup_details:
-            logger.error("Failed to fetch camera setup details from the database. Exiting...")
-            return
-            
-        camera_details_json = json.dumps({
-            "cameraDetails": camera_setup_details["cameraDetails"]
-        })
-        
-        # Initialize and run tracker
-        tracker = MultiCameraTracker(camera_details_json, db_connection_string)
-        await tracker.run()
-        
+        if not db_connection_string:
+            raise ValueError("Database connection string not found in environment variables")
+        tracking_system = MultiUserTrackingSystem(db_connection_string)
+        await tracking_system.initialize()
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            await tracking_system.stop_all()
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
         raise
-    finally:
-        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     try:
